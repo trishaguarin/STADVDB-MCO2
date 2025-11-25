@@ -120,7 +120,7 @@ def insert_order(level):
     VALUES (%s, 0, %s, 0, NOW(), NOW(), 0, 1)
     """
 
-    cursor.execute (sql, (deliveryDate, orderID))
+    cursor.execute (sql, (orderID, deliveryDate))
     node.commit() 
 
     if node != central_node:
@@ -144,8 +144,8 @@ def read_order(level):
             cursor.close()
             if row:
                 print(f"[{label}] Delivery Date: {row['deliveryDate']}")
-        except:
-            pass
+        except Exception as e:
+            print(f"Error: {e}")
 
 
 def update_order(level):
