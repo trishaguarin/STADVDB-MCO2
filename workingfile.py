@@ -108,7 +108,7 @@ def replicate_to_partitions(order_id, delivery_date):
 # ========================================================================
 
 def insert_order(level):
-    orderID = input("Input orderID: ")
+    orderID = int(input("Input orderID: "))
     deliveryDate = input("Input Delivery Date (YYYY-MM-DD): ")
     
     node = determine_node(deliveryDate)
@@ -133,7 +133,7 @@ def insert_order(level):
 
 
 def read_order(level):
-    orderID = input("Input orderID: ")
+    orderID = int(input("Input orderID: "))
     
     for label, node in [("Central", central_node), ("Node2", node2), ("Node3", node3)]:
         try:
@@ -149,7 +149,7 @@ def read_order(level):
 
 
 def update_order(level):
-    orderID = input("Input orderID: ")
+    orderID = int(input("Input orderID: "))
     deliveryDate = input("New Delivery Date (YYYY-MM-DD): ")
 
     node = determine_node(deliveryDate)
@@ -173,7 +173,7 @@ def update_order(level):
     cursor.close()
     
 def delete_order(level):
-    orderID = input("Input orderID: ")
+    orderID = int(input("Input orderID: "))
     
     sql = """
         DELETE FROM factorders
