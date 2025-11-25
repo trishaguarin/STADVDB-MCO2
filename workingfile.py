@@ -217,11 +217,17 @@ def menu():
         option = input("Choose option: ")
 
         match option:
-            case 1: insert_order(level)
-            case 2: read_order(level)
-            case 3: update_order(level)
-            case 4: delete_order(level)
-            case 5: break
-            case _: print("Invalid Choice")
+            case '1': 
+                insert_order(level)
+            case '2': 
+                read_order(level)
+            case '3': 
+                update_order(level)
+            case '4': 
+                delete_order(level)
+            case '5':
+                break
+            case _: 
+                print("Invalid Choice")
                 
 menu() 
