@@ -123,15 +123,23 @@ def insert_order(level):
     cursor.execute (sql, (deliveryDate, orderID))
     node.commit() 
 
+    if node != central_node:
+        replicate_to_central(orderID, deliveryDate)
+    else:
+        replicate_to_partitions(orderID, deliveryDate)
+
+    print("Insert and replication success.\n")
+    cursor.close()
+
+
 def read_order(level):
-    #STILL TO DO
     orderID = input("Input orderID: ")
     
     for label, node in [("Central", central_node), ("Node2", node2), ("Node3", node3)]:
         try:
             set_isolation_level(node, level)
             cursor = node.cursor(dictionary=True)
-            cursor.execute("SELECT * FROM FactOrder WHERE orderID = %s", (order_id,))
+            cursor.execute("SELECT * FROM FactOrder WHERE orderID = %s", (orderID,))
             row = cursor.fetchone()
             cursor.close()
             if row:
@@ -161,6 +169,9 @@ def update_order(level):
     else:
         replicate_to_partitions(orderID, deliveryDate)
 
+    print("Update and replicate successful.\n")
+    cursor.close()
+    
 def delete_order(level):
     orderID = input("Input orderID: ")
     
@@ -173,8 +184,9 @@ def delete_order(level):
         cursor = node.cursor() 
         cursor.execute(sql, (orderID))
         node.commit()
-        cursor.close
+        cursor.close()
     
+    print("Delete successful\n")
 
 # ========================================================================
 # 6. MAIN MENU
@@ -182,7 +194,7 @@ def delete_order(level):
 
 def menu():
     while True: 
-        print("SELECT ISOLATION LEVEL TO USE\n")
+        print("\nSELECT ISOLATION LEVEL TO USE\n")
         print("1. READ UNCOMMITTED")
         print("2. READ COMMITTED")
         print("3. REPEATABLE READ")
@@ -195,7 +207,7 @@ def menu():
         
         level = ISOLATION_LEVELS[user_input]
 
-        print("MAIN MENU")
+        print("\nMAIN MENU")
         print("1. Insert")
         print("2. Read")
         print("3. Update")
