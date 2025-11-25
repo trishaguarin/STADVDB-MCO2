@@ -188,12 +188,12 @@ def menu():
         print("3. REPEATABLE READ")
         print("4. SERIALIZABLE")
     
-        input = input()
-        if input not in ISOLATION_LEVELS:
+        user_input = input()
+        if user_input not in ISOLATION_LEVELS:
             print("Invalid.")
             continue
         
-        level = ISOLATION_LEVELS[input]
+        level = ISOLATION_LEVELS[user_input]
 
         print("MAIN MENU")
         print("1. Insert")
