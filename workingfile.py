@@ -75,7 +75,7 @@ def replicate_to_central(order_id, delivery_date):
     cursor = central_node.cursor()
 
     sql = """
-    INSERT INTO FactOrder (orderID, userID, deliveryDate, riderID, createdAt, updatedAt, productID, quantity)
+    INSERT INTO factorders (orderID, userID, deliveryDate, riderID, createdAt, updatedAt, productID, quantity)
     VALUES (%s, 0, %s, 0, NOW(), NOW(), 0, 1)
     ON DUPLICATE KEY UPDATE 
         deliveryDate = VALUES(deliveryDate),
@@ -92,7 +92,7 @@ def replicate_to_partitions(order_id, delivery_date):
     cursor = node.cursor()
 
     sql = """
-    INSERT INTO FactOrder (orderID, userID, deliveryDate, riderID, createdAt, updatedAt, productID, quantity)
+    INSERT INTO factorders (orderID, userID, deliveryDate, riderID, createdAt, updatedAt, productID, quantity)
     VALUES (%s, 0, %s, 0, NOW(), NOW(), 0, 1)
     ON DUPLICATE KEY UPDATE 
         deliveryDate = VALUES(deliveryDate),
@@ -139,11 +139,11 @@ def read_order(level):
         try:
             set_isolation_level(node, level)
             cursor = node.cursor(dictionary=True)
-            cursor.execute("SELECT * FROM FactOrder WHERE orderID = %s", (orderID,))
+            cursor.execute("SELECT deliveryDate FROM factorders WHERE orderID = %s", (orderID,))
             row = cursor.fetchone()
             cursor.close()
             if row:
-                print(f"[{label}] {row}")
+                print(f"[{label}] Delivery Date: {row['deliveryDate']}")
         except:
             pass
 
