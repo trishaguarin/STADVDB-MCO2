@@ -118,7 +118,7 @@ def replicate_to_central(order_id, delivery_date, level):
         logger.info(f"Replicated order {order_id} to central node")
         return True
     except Exception as e:
-        logger.error("Failed to replicate to central node: {e}")
+        logger.error(f"Failed to replicate to central node: {e}")
         try:
             central_node.rollback()
         except:
@@ -203,20 +203,20 @@ def insert_order(level):
 
         if node != central_node:
             if not replicate_to_central(orderID, deliveryDate, level):
-                print(f"Error: Replication to central node failed for {label}")
+                print("fError: Replication to central node failed for {lab}")
         else:
             if not replicate_to_partitions(orderID, deliveryDate, level):
-                print(f"Error: Replication to partition failed for {label}")
+                print("Error: Replication to partition failed")
 
         print("Insert and replication success.\n")
 
     except Error as e:
-        logger.error(f"Insert failed: {e} on {label}")
+        logger.error(f"Insert failed: {e}")
         try:
             node.rollback()
         except:
             pass
-        print(f"Insert failed: {e} on for {label}\n")
+        print(f"Insert failed: {e}\n")
 
 def read_order(level):
     orderID = int(input("Input orderID: "))
@@ -243,69 +243,107 @@ def read_order(level):
             print(f"[{label}] Read failed")
 
 def update_order(level):
+
     try:
-        orderID_raw = input("Input orderID: ").strip()
-        if not orderID_raw.isdigit():
-            print("Invalid orderID (must be integer).")
-            return
-        orderID = int(orderID_raw)
+        orderID = int(input("Input orderID: "))
+        deliveryDate = input("New Delivery Date (YYYY-MM-DD): ")
 
-        new_deliveryDate = input("New Delivery Date (YYYY-MM-DD): ").strip()
-        if len(new_deliveryDate) < 10:
-            print("Invalid date format. Use YYYY-MM-DD.")
-            return
+        node = determine_node(deliveryDate)
 
-        # Determine target partition based on the NEW delivery date (your partition rule)
-        node = determine_node(new_deliveryDate)
         if not check_connection(node):
             print("Target node unavailable")
             return
 
-        # Check if the order exists on that node BEFORE updating.
+        #START HERE UNG CHANGE
+
+        # Check if the order exists in the target node before updating
         try:
             chk_cur = node.cursor()
-            chk_cur.execute("SELECT 1 FROM FactOrders WHERE orderID = %s LIMIT 1", (orderID,))
-            exists_on_target = chk_cur.fetchone() is not None
+            chk_cur.execute("SELECT deliveryDate FROM FactOrders WHERE orderID = %s LIMIT 1", (orderID,))
+            existing_row = chk_cur.fetchone()
             chk_cur.close()
-            if not exists_on_target:
-                print(f"Order {orderID} not found on target node for date {new_deliveryDate}. Update aborted.")
+
+            if not existing_row:
+                print(f"Order {orderID} not found on target node for date {deliveryDate}. Update aborted.")
                 return
         except Exception as e:
             logger.exception("Existence check on target node failed: %s", e)
             print("Could not verify order existence on target node. Update aborted.")
             return
 
-        # Perform the update
-        set_isolation_level(node, level)
-        cursor = node.cursor()
-        sql = """
-            UPDATE FactOrders
-            SET deliveryDate = %s, updatedAt = NOW()
-            WHERE orderID = %s
-        """
-        try:
-            logger.info("UPDATE SQL on node: %s -- PARAMS: (%s, %s)", sql.strip(), new_deliveryDate, orderID)
-            cursor.execute(sql, (new_deliveryDate, orderID))
-            node.commit()
-            cursor.close()
-        except Exception as e:
-            logger.exception("Update failed: %s", e)
-            try:
-                node.rollback()
-            except:
-                pass
-            print("Update failed.")
-            return
+        # Step 4: Determine the current year of the existing delivery date
+        existing_deliveryDate = existing_row[0]  # Assuming 'deliveryDate' is the first column
+        existing_year = str(existing_deliveryDate)[:4]
+        new_year = deliveryDate[:4]
 
-        # Replicate
+        # Step 5: Handle Year Change (If the year has changed, we need to move the order)
+        if existing_year != new_year:
+            # Delete from the old node
+            old_node = determine_node(existing_deliveryDate)
+            if check_connection(old_node):
+                try:
+                    set_isolation_level(old_node, level)
+                    cursor = old_node.cursor()
+                    cursor.execute("DELETE FROM FactOrders WHERE orderID = %s", (orderID,))
+                    old_node.commit()
+                    cursor.close()
+                    logger.info(f"Order {orderID} deleted from {old_node}")
+                except Exception as e:
+                    logger.exception(f"Failed to delete from {old_node}: {e}")
+                    print(f"Failed to delete order from {old_node}. Update aborted.")
+                    return
+
+            # Insert into the new node (target node based on new year)
+            node = determine_node(deliveryDate)  # This gets the new node based on the year
+            if check_connection(node):
+                try:
+                    set_isolation_level(node, level)
+                    cursor = node.cursor()
+
+                    # Prepare the INSERT query
+                    sql = """
+                        INSERT INTO FactOrders (orderID, userID, deliveryDate, riderID, createdAt, updatedAt, productID, quantity)
+                        VALUES (%s, 0, %s, 0, NOW(), NOW(), 0, 1)
+                    """
+                    cursor.execute(sql, (orderID, deliveryDate))
+                    node.commit()
+                    cursor.close()
+                    logger.info(f"Order {orderID} inserted into {node}")
+                except Exception as e:
+                    logger.exception(f"Failed to insert into {node}: {e}")
+                    print(f"Failed to insert order into {node}. Update aborted.")
+                    return
+
+        # Step 6: Update central node (no year change needed here, just an update)
+        if check_connection(central_node):
+            try:
+                set_isolation_level(central_node, level)
+                cursor = central_node.cursor()
+
+                # Prepare the UPDATE query for central node
+                sql = """
+                    UPDATE FactOrders
+                    SET deliveryDate = %s, updatedAt = NOW()
+                    WHERE orderID = %s
+                """
+                cursor.execute(sql, (deliveryDate, orderID))
+                central_node.commit()
+                cursor.close()
+                logger.info(f"Central node updated for order {orderID}")
+            except Exception as e:
+                logger.exception(f"Failed to update central node: {e}")
+                print(f"Failed to update central node. Update aborted.")
+                return
+
+        # Step 7: Replicate the update across all nodes
         if node != central_node:
-            if not replicate_to_central(orderID, new_deliveryDate, level):
+            if not replicate_to_central(orderID, deliveryDate, level):
                 print("Warning: replication to central failed")
         else:
-            if not replicate_to_partitions(orderID, new_deliveryDate, level):
+            if not replicate_to_partitions(orderID, deliveryDate, level):
                 print("Warning: replication to partitions failed")
 
-        print("Update and replicate successful.\n")
+        print("Update and replication successful.\n")
 
     except Exception as e:
         logger.exception("Unexpected error in update_order: %s", e)
@@ -319,19 +357,16 @@ def delete_order(level):
         DELETE FROM FactOrders
         WHERE orderID = %s
     """
-    success_count = 0
-    for label, node in [(central_node, "Central"), (node2, "Node2"), (node3, "Node3")]:
+    for node, label in [(central_node, "Central"), (node2, "Node2"), (node3, "Node3")]:
         if not check_connection(node):
             logger.warning("%s not available during delete", label)
             continue
         try:
-            set_isolation_level(node, level)
             cur = node.cursor()
             logger.info("DELETE on %s: %s", label, orderID)
             cur.execute(sql, (orderID,)) 
             node.commit()
             cur.close()
-            success_count += 1
         except Exception as e:
             logger.exception("Delete on %s failed: %s", label, e)
             try:
@@ -339,10 +374,7 @@ def delete_order(level):
             except:
                 pass
     
-    if success_count > 0:
-        print(f"Delete successful on {success_count} node(s)\n")
-    else:
-        print("Delete failed on all nodes\n")   # print("Delete successful\n")
+    print("Delete successful\n")
 
 # ========================================================================
 # 6. MAIN MENU
@@ -387,16 +419,5 @@ def menu():
                 break
             case _: 
                 print("Invalid Choice")
-                
-if __name__ == "__main__":
-    try:
-        menu()
-    finally:
-        for node in [central_node, node2, node3]:
-            if node and check_connection(node):
-                try:
-                    node.close()
-                    logger.info("Connection closed")
-                except:
-                    pass              
+                            
 menu() 
