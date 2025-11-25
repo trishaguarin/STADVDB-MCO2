@@ -109,9 +109,9 @@ def replicate_to_central(order_id, delivery_date, level):
         VALUES (%s, 0, %s, 0, NOW(), NOW(), 0, 1)
         ON DUPLICATE KEY UPDATE 
             deliveryDate = VALUES(deliveryDate),
-            updatedAt = NOW();
+            updatedAt = NOW()
         """
-
+        logger.info("REPL->CENTRAL SQL: %s -- PARAMS: (%s, %s)", sql.strip(), order_id, delivery_date)
         cursor.execute(sql, (order_id, delivery_date))
         central_node.commit()
         cursor.close()
@@ -124,6 +124,9 @@ def replicate_to_central(order_id, delivery_date, level):
 def replicate_to_partitions(order_id, delivery_date, level):
     node = determine_node(delivery_date)
     cursor = node.cursor()
+    if not check_connection(node):
+        logger.error("Target partition node unavailable for replication")
+        return False
 
     try:
         set_isolation_level(central_node, level)
@@ -134,12 +137,13 @@ def replicate_to_partitions(order_id, delivery_date, level):
         VALUES (%s, 0, %s, 0, NOW(), NOW(), 0, 1)
         ON DUPLICATE KEY UPDATE 
             deliveryDate = VALUES(deliveryDate),
-            updatedAt = NOW();
+            updatedAt = NOW()
         """
-
+        logger.info("REPL->PART SQL: %s -- PARAMS: (%s, %s)", sql.strip(), order_id, delivery_date)
         cursor.execute(sql, (order_id, delivery_date))
         node.commit()
         cursor.close()
+        logger.info("Replicated order %s to partition node (deliveryDate=%s)", order_id, delivery_date)
         
     except:
         logger.error("Failed to replicate to noncentral nodes.")
@@ -201,7 +205,7 @@ def read_order(level):
             row = cursor.fetchone()
             cursor.close()
 
-            if row:
+            if row and row.get('deliveryDate') is not None:
                 print(f"[{label}] Delivery Date: {row['deliveryDate']}")
             else:
                 print(f"[{label}] Order not found")
@@ -215,6 +219,10 @@ def update_order(level):
     deliveryDate = input("New Delivery Date (YYYY-MM-DD): ")
 
     node = determine_node(deliveryDate)
+    if not check_connection(node):
+        print("Target node unavailable")
+        return
+
     set_isolation_level(node, level)
     cursor = node.cursor()
     sql = """
@@ -223,13 +231,27 @@ def update_order(level):
         WHERE orderID = %s
         """
     
-    cursor.execute(sql, (deliveryDate, orderID))
-    node.commit()
-    
+    try:
+        logger.info("UPDATE SQL: %s -- PARAMS: (%s, %s)", sql.strip(), deliveryDate, orderID)
+        cursor.execute(sql, (deliveryDate, orderID))
+        node.commit()
+    except Exception as e:
+        logger.exception("Update failed: %s", e)
+        try:
+            node.rollback()
+        except:
+            pass
+        cursor.close()
+        print("Update failed.")
+        return
+
+    # replicate
     if node != central_node:
-        replicate_to_central(orderID, deliveryDate, level)
+        if not replicate_to_central(orderID, deliveryDate, level):
+            print("Warning: replication to central failed")
     else:
-        replicate_to_partitions(orderID, deliveryDate, level)
+        if not replicate_to_partitions(orderID, deliveryDate, level):
+            print("Warning: replication to partitions failed")
 
     print("Update and replicate successful.\n")
     cursor.close()
@@ -241,12 +263,22 @@ def delete_order(level):
         DELETE FROM FactOrders
         WHERE orderID = %s
     """
-    
-    for node in [central_node, node2, node3]:
-        cursor = node.cursor() 
-        cursor.execute(sql, (orderID))
-        node.commit()
-        cursor.close()
+    for node, label in [(central_node, "Central"), (node2, "Node2"), (node3, "Node3")]:
+        if not check_connection(node):
+            logger.warning("%s not available during delete", label)
+            continue
+        try:
+            cur = node.cursor()
+            logger.info("DELETE on %s: %s", label, orderID)
+            cur.execute(sql, (orderID,)) 
+            node.commit()
+            cur.close()
+        except Exception as e:
+            logger.exception("Delete on %s failed: %s", label, e)
+            try:
+                node.rollback()
+            except:
+                pass
     
     print("Delete successful\n")
 
