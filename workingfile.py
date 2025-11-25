@@ -75,7 +75,7 @@ def replicate_to_central(order_id, delivery_date):
     cursor = central_node.cursor()
 
     sql = """
-    INSERT INTO factorders (orderID, userID, deliveryDate, riderID, createdAt, updatedAt, productID, quantity)
+    INSERT INTO FactOrders (orderID, userID, deliveryDate, riderID, createdAt, updatedAt, productID, quantity)
     VALUES (%s, 0, %s, 0, NOW(), NOW(), 0, 1)
     ON DUPLICATE KEY UPDATE 
         deliveryDate = VALUES(deliveryDate),
@@ -92,7 +92,7 @@ def replicate_to_partitions(order_id, delivery_date):
     cursor = node.cursor()
 
     sql = """
-    INSERT INTO factorders (orderID, userID, deliveryDate, riderID, createdAt, updatedAt, productID, quantity)
+    INSERT INTO FactOrders (orderID, userID, deliveryDate, riderID, createdAt, updatedAt, productID, quantity)
     VALUES (%s, 0, %s, 0, NOW(), NOW(), 0, 1)
     ON DUPLICATE KEY UPDATE 
         deliveryDate = VALUES(deliveryDate),
@@ -116,7 +116,7 @@ def insert_order(level):
 
     cursor = node.cursor()
     sql = """
-    INSERT INTO factorders (orderID, userID, deliveryDate, riderID, createdAt, updatedAt, productID, quantity)
+    INSERT INTO FactOrders (orderID, userID, deliveryDate, riderID, createdAt, updatedAt, productID, quantity)
     VALUES (%s, 0, %s, 0, NOW(), NOW(), 0, 1)
     """
 
@@ -139,7 +139,7 @@ def read_order(level):
         try:
             set_isolation_level(node, level)
             cursor = node.cursor(dictionary=True)
-            cursor.execute("SELECT deliveryDate FROM factorders WHERE orderID = %s", (orderID,))
+            cursor.execute("SELECT deliveryDate FROM FactOrders WHERE orderID = %s", (orderID,))
             row = cursor.fetchone()
             cursor.close()
             if row:
@@ -156,7 +156,7 @@ def update_order(level):
     set_isolation_level(node, level)
     cursor = node.cursor()
     sql = """
-        UPDATE factorders
+        UPDATE FactOrders
         SET deliveryDate = %s, updatedAT = NOW()
         WHERE orderID = %s
         """
@@ -176,7 +176,7 @@ def delete_order(level):
     orderID = int(input("Input orderID: "))
     
     sql = """
-        DELETE FROM factorders
+        DELETE FROM FactOrders
         WHERE orderID = %s
     """
     
