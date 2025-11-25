@@ -79,7 +79,6 @@ ISOLATION_LEVELS = {
 # ========================================================================
 
 def determine_node(delivery_date):
-
     try:
         year = int(str(delivery_date)[:4])
         if year == 2024:
@@ -96,12 +95,13 @@ def determine_node(delivery_date):
 # 4. REPLICATION HELPERS
 # ========================================================================
 
-def replicate_to_central(order_id, delivery_date):
+def replicate_to_central(order_id, delivery_date, level):
     if not check_connection(central_node):
         logger.error("Central node unavailable for replication")
         return False
 
     try:   
+        set_isolation_level(central_node, level)
         cursor = central_node.cursor()
 
         sql = """
@@ -121,21 +121,29 @@ def replicate_to_central(order_id, delivery_date):
         logger.error("Failed to replicate to central node.")
         return False
         
-def replicate_to_partitions(order_id, delivery_date):
+def replicate_to_partitions(order_id, delivery_date, level):
     node = determine_node(delivery_date)
     cursor = node.cursor()
 
-    sql = """
-    INSERT INTO FactOrders (orderID, userID, deliveryDate, riderID, createdAt, updatedAt, productID, quantity)
-    VALUES (%s, 0, %s, 0, NOW(), NOW(), 0, 1)
-    ON DUPLICATE KEY UPDATE 
-        deliveryDate = VALUES(deliveryDate),
-        updatedAt = NOW();
-    """
+    try:
+        set_isolation_level(central_node, level)
+        cursor = node.cursor()
 
-    cursor.execute(sql, (order_id, delivery_date))
-    node.commit()
-    cursor.close()
+        sql = """
+        INSERT INTO FactOrders (orderID, userID, deliveryDate, riderID, createdAt, updatedAt, productID, quantity)
+        VALUES (%s, 0, %s, 0, NOW(), NOW(), 0, 1)
+        ON DUPLICATE KEY UPDATE 
+            deliveryDate = VALUES(deliveryDate),
+            updatedAt = NOW();
+        """
+
+        cursor.execute(sql, (order_id, delivery_date))
+        node.commit()
+        cursor.close()
+        
+    except:
+        logger.error("Failed to replicate to noncentral nodes.")
+        return False
 
 # ========================================================================
 # 5. CRUD OPERATIONS
@@ -182,16 +190,25 @@ def read_order(level):
     orderID = int(input("Input orderID: "))
     
     for label, node in [("Central", central_node), ("Node2", node2), ("Node3", node3)]:
+        if not check_connection(node):
+            print("f[{label}] Node unavailable")
+            continue
+
         try:
             set_isolation_level(node, level)
-            cursor = node.cursor(dictionary=True)
+            cursor = node.cursor(dictionary=True, buffered=True)
             cursor.execute("SELECT deliveryDate FROM FactOrders WHERE orderID = %s", (orderID,))
             row = cursor.fetchone()
             cursor.close()
+
             if row:
                 print(f"[{label}] Delivery Date: {row['deliveryDate']}")
+            else:
+                print(f"[{label}] Order not found")
+
         except Exception as e:
-            print(f"Error: {e}")
+            logger.error(f"Read from {label} failed: {e}")
+            print(f"[{label}] Read failed")
 
 def update_order(level):
     orderID = int(input("Input orderID: "))
@@ -210,9 +227,9 @@ def update_order(level):
     node.commit()
     
     if node != central_node:
-        replicate_to_central(orderID, deliveryDate)
+        replicate_to_central(orderID, deliveryDate, level)
     else:
-        replicate_to_partitions(orderID, deliveryDate)
+        replicate_to_partitions(orderID, deliveryDate, level)
 
     print("Update and replicate successful.\n")
     cursor.close()
