@@ -471,4 +471,5 @@ def menu():
             case _: 
                 print("Invalid Choice")
 
+if __name__ == "__main__":
     menu()
