@@ -45,7 +45,7 @@ DB_MAP = {
 
 def set_up_test_data():
     for host, name in NODE_HOSTS:
-        conn = connect_node(host, "stadvdb", "Password123!", DB_MAP[name])
+        conn = connect_node(node_host, "stadvdb", "Password123!", DB_MAP[node_name])
         if not conn: 
             logger.error(f"{name}: connection failed for setup")
             continue
@@ -62,7 +62,7 @@ def set_up_test_data():
     
 def read_transaction(node_host, node_name, orderID, isolation_level, delay=0):
     # read order from a node
-    conn = connect_node(host, "stadvdb", "Password123!", DB_MAP[name])
+    conn = connect_node(node_host, "stadvdb", "Password123!", DB_MAP[node_name])
 
     if not conn:
         logger.error(f"{node_name}: Connection failed")
@@ -99,7 +99,7 @@ def read_transaction(node_host, node_name, orderID, isolation_level, delay=0):
 def update_transaction(node_host, node_name, orderID, new_date, isolation_level, delay=0):
     #update an order's delivery date
 
-    conn = connect_node(host, "stadvdb", "Password123!", DB_MAP[name])
+    conn = connect_node(node_host, "stadvdb", "Password123!", DB_MAP[node_name])
 
     if not conn:
         logger.error(f"{node_name}: Connection failed")
@@ -237,7 +237,7 @@ def test_concurrent_writes(isolation_level):
     # check final state on both nodes
     print("\nChecking final state on all nodes:")
     for host, name in [("10.2.14.120", "Central"), ("10.2.14.121", "Node2")]:
-        conn = connect_node(host, "stadvdb", "Password123!", DB_MAP[name])
+        conn = connect_node(node_host, "stadvdb", "Password123!", DB_MAP[node_name])
         if conn:
             cursor = conn.cursor()
             cursor.execute("SELECT deliveryDate FROM FactOrders WHERE orderID = 999999")
