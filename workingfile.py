@@ -78,25 +78,18 @@ ISOLATION_LEVELS = {
 # 3. PARTITIONING RULE
 # ========================================================================
 
-# adjusted so that it gets sent to both central and respective node. 
 def determine_node(delivery_date):
     try:
         year = int(str(delivery_date)[:4])
-        
-        # Determine the primary node based on the year
         if year == 2024:
-            primary_node = node2
+            return node2
         elif year == 2025:
-            primary_node = node3
+            return node3
         else:
-            primary_node = central_node
-        
-        # Return both the primary node and central node
-        return [primary_node, central_node]
-    
+            return central_node
     except:
         logger.error(f"Invalid date format: {delivery_date}")
-        return False
+        return central_node
 
 # ========================================================================
 # 4. REPLICATION HELPERS
