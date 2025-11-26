@@ -2,6 +2,7 @@ import mysql.connector
 import threading
 import time
 import logging
+from mysql.connector import Error
 
 logging.basicConfig(
     level=logging.INFO,
