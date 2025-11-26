@@ -47,7 +47,7 @@ NODE_HOSTS = [
 
 def set_up_test_data():
     for host, name in NODE_HOSTS:
-        database = get_database_for_node(host, name)
+        database = get_database(host, name)
         conn = connect_node(host, "stadvdb", "Password123!", database)
 
         if not conn: 
@@ -242,7 +242,7 @@ def test_concurrent_writes(isolation_level):
     # check final state on both nodes
     print("\nChecking final state on all nodes:")
     for host, name in [("10.2.14.120", "Central"), ("10.2.14.121", "Node2")]:
-        database = get_database_for_node(host, name)
+        database = get_database(host, name)
         conn = connect_node(host, "stadvdb", "Password123!", database)
 
         if conn:
