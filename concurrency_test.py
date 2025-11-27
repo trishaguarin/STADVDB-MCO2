@@ -173,31 +173,25 @@ def test_write_and_reads(isolation_level):
     print(f"Isolation Level: {isolation_level}")
     print("================================================")
 
-    orderID = 999999
-    new_date = '2024-12-31'
+    writer_conn = connect_node("10.2.14.120", "stadvdb", "Password123!", "stadvdb_node1")
+    set_isolation_level(writer_conn, isolation_level)
     
     def writer_with_delay():
-        """Writer that delays commit to test dirty reads"""
-        database = get_database("10.2.14.120", "central")
-        conn = connect_node("10.2.14.120", "stadvdb", "Password123!", database)
-        set_isolation_level(conn, isolation_level)
-        cursor = conn.cursor()
-        conn.start_transaction()
+        """Writer uses shared connection to maintain transaction"""
+        cursor = writer_conn.cursor()
+        writer_conn.start_transaction()
         
         print("WRITER: Starting UPDATE (will delay commit)...")
-        cursor.execute("""
-            UPDATE FactOrders SET deliveryDate = %s, updatedAt = NOW() 
-            WHERE orderID = %s
-        """, (new_date, orderID))
+        cursor.execute("UPDATE FactOrders SET deliveryDate = '2024-12-31' WHERE orderID = 999999")
         print("WRITER: Update executed, waiting 3 seconds before commit...")
-        time.sleep(3)  # =dirty read window
-        conn.commit()
+        time.sleep(3)  # dirty read window
+        
+        writer_conn.commit()
         print("WRITER: Committed")
         cursor.close()
-        conn.close()
     
     def reader(node_host, node_name, delay=0):
-        """Reader that tries to read during write transaction"""
+        """Reader tries to read during writer's transaction"""
         time.sleep(delay)
         database = get_database(node_host, node_name)
         conn = connect_node(node_host, "stadvdb", "Password123!", database)
@@ -205,18 +199,23 @@ def test_write_and_reads(isolation_level):
         cursor = conn.cursor()
         
         print(f"{node_name}: Reading during write transaction...")
-        cursor.execute("SELECT deliveryDate FROM FactOrders WHERE orderID = %s", (orderID,))
-        result = cursor.fetchone()
-        if result:
-            print(f"{node_name}: Saw delivery date = {result[0]}")
-        cursor.close()
-        conn.close()
+        try:
+            cursor.execute("SELECT deliveryDate FROM FactOrders WHERE orderID = 999999")
+            result = cursor.fetchone()
+            if result:
+                print(f"{node_name}: Saw delivery date = {result[0]}")
+                if result[0] == '2024-12-31':
+                    print(f"*** {node_name}: DIRTY READ DETECTED! ***")
+            cursor.close()
+            conn.close()
+        except Exception as e:
+            print(f"{node_name}: BLOCKED or ERROR - {e}")
     
     writer = threading.Thread(target=writer_with_delay, name="Writer-Central")
     readers = [
-        threading.Thread(target=reader, args=("10.2.14.120", "Reader1-Central", 1), name="Reader1-Central"),
-        threading.Thread(target=reader, args=("10.2.14.121", "Reader2-Node2", 1.5), name="Reader2-Node2"),
-        threading.Thread(target=reader, args=("10.2.14.122", "Reader3-Node3", 2), name="Reader3-Node3")
+        threading.Thread(target=reader, args=("10.2.14.120", "Reader1-Central", 1)),
+        threading.Thread(target=reader, args=("10.2.14.121", "Reader2-Node2", 1.5)),
+        threading.Thread(target=reader, args=("10.2.14.122", "Reader3-Node3", 2))
     ]
 
     writer.start()
@@ -226,9 +225,9 @@ def test_write_and_reads(isolation_level):
     writer.join()
     for r in readers:
         r.join()
-
+    
+    writer_conn.close()
     print("\nWrite and read test completed")
-
 def test_concurrent_writes(isolation_level):
     print("\n================================================")
     print("TESTING CASE 3: CONCURRENT WRITES")
