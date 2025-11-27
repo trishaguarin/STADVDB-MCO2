@@ -174,69 +174,83 @@ def test_write_and_reads(isolation_level):
     print("================================================")
 
     orderID = 999999
+    new_date = '2024-12-31'
     
-    def writer_with_uncommitted_data():
-        """Writer that creates uncommitted data for dirty reads"""
+    def writer():
+        """Writer that maintains long-running transaction"""
         database = get_database("10.2.14.120", "central")
         conn = connect_node("10.2.14.120", "stadvdb", "Password123!", database)
         set_isolation_level(conn, isolation_level)
         cursor = conn.cursor()
         conn.start_transaction()
         
-        print("WRITER: Updating to '2024-12-31' (will delay commit)...")
-        cursor.execute("UPDATE FactOrders SET deliveryDate = '2024-12-31' WHERE orderID = %s", (orderID,))
+        print("WRITER: Starting UPDATE (will delay commit)...")
+        cursor.execute("UPDATE FactOrders SET deliveryDate = %s WHERE orderID = %s", (new_date, orderID))
+        print("WRITER: Update executed, waiting 3 seconds before commit...")
         
-        print("WRITER: Sleeping 4 seconds before commit...")
-        time.sleep(4)
+        time.sleep(3)  # window for dirty reads
         
         conn.commit()
-        print("WRITER: Finally committed")
+        print("WRITER: Committed")
         cursor.close()
         conn.close()
     
-    def reader_that_tries_dirty_read(node_host, node_name, delay=1):
-        """Reader that specifically tries to read during write transaction"""
+    def reader(node_host, node_name, delay=0):
+        """Reader tries to read during writer's transaction"""
         time.sleep(delay)
         database = get_database(node_host, node_name)
         conn = connect_node(node_host, "stadvdb", "Password123!", database)
         set_isolation_level(conn, isolation_level)
         cursor = conn.cursor()
         
-        print(f"{node_name}: Attempting to read DURING write transaction...")
-        cursor.execute("SELECT deliveryDate FROM FactOrders WHERE orderID = %s", (orderID,))
-        result = cursor.fetchone()
-        
-        if result:
-            date_seen = result[0]
-            print(f"{node_name}: SAW → {date_seen}")
-            if date_seen == '2024-12-31':
-                print(f"*** {node_name}: DIRTY READ DETECTED! ***")
-            else:
-                print(f"{node_name}: No dirty read - saw original value")
-        else:
-            print(f"{node_name}: No data found")
-        
-        cursor.close()
-        conn.close()
+        print(f"{node_name}: Attempting to read during write transaction...")
+        try:
+            if isolation_level in ['REPEATABLE READ', 'SERIALIZABLE']:
+                conn.start_transaction()
+            
+            cursor.execute("SELECT deliveryDate FROM FactOrders WHERE orderID = %s", (orderID,))
+            result = cursor.fetchone()
+            
+            if result:
+                current_date = result[0]
+                print(f"{node_name}: Saw delivery date = {current_date}")
+                
+                # detect dirty reads
+                if current_date == new_date and "WRITER: Committed" not in [line for line in open(__file__).readlines() if "WRITER: Committed" in line]:
+                    print(f"*** {node_name}: DIRTY READ DETECTED! ***")
+                elif current_date == new_date:
+                    print(f"{node_name}: Read COMMITTED value")
+                else:
+                    print(f"{node_name}: Read previous value (no dirty read)")
+            
+            if isolation_level in ['REPEATABLE READ', 'SERIALIZABLE']:
+                conn.commit()
+                
+        except Exception as e:
+            print(f"{node_name}: BLOCKED or ERROR - {e}")
+            if isolation_level in ['REPEATABLE READ', 'SERIALIZABLE']:
+                conn.rollback()
+        finally:
+            cursor.close()
+            conn.close()
     
-    writer = threading.Thread(target=writer_with_uncommitted_data, name="Writer-Central")
+    writer_thread = threading.Thread(target=writer, name="Writer-Central")
     readers = [
-        threading.Thread(target=reader_that_tries_dirty_read, args=("10.2.14.120", "Reader1-Central", 1)),
-        threading.Thread(target=reader_that_tries_dirty_read, args=("10.2.14.121", "Reader2-Node2", 2)),
-        threading.Thread(target=reader_that_tries_dirty_read, args=("10.2.14.122", "Reader3-Node3", 3))
+        threading.Thread(target=reader, args=("10.2.14.120", "Reader1-Central", 1)),
+        threading.Thread(target=reader, args=("10.2.14.121", "Reader2-Node2", 1.5)),
+        threading.Thread(target=reader, args=("10.2.14.122", "Reader3-Node3", 2))
     ]
 
-    writer.start()
+    writer_thread.start()
     for r in readers:
         r.start()
 
-    writer.join()
+    writer_thread.join()
     for r in readers:
         r.join()
-    
-    writer_conn.close()
+
     print("\nWrite and read test completed")
-    
+
 def test_concurrent_writes(isolation_level):
     print("\n================================================")
     print("TESTING CASE 3: CONCURRENT WRITES")
@@ -246,29 +260,30 @@ def test_concurrent_writes(isolation_level):
     orderID = 999999
 
     def writer_with_conflict(host, name, new_date, delay=0):
-        """Writer that might conflict with other writers"""
+        """Writer that creates real conflicts"""
         time.sleep(delay)
         database = get_database(host, name)
         conn = connect_node(host, "stadvdb", "Password123!", database)
         set_isolation_level(conn, isolation_level)
         cursor = conn.cursor()
-        conn.start_transaction()
         
-        print(f"{name}: Starting UPDATE to {new_date}...")
         try:
-            cursor.execute("""
-                UPDATE FactOrders SET deliveryDate = %s, updatedAt = NOW() 
-                WHERE orderID = %s
-            """, (new_date, orderID))
+            conn.start_transaction()
+            print(f"{name}: Starting UPDATE to {new_date}...")
             
-            print(f"{name}: Update executed, waiting before commit...")
-            time.sleep(2)  # conflict window
+            cursor.execute("UPDATE FactOrders SET deliveryDate = %s WHERE orderID = %s", (new_date, orderID))
+            print(f"{name}: Update executed, rows affected: {cursor.rowcount}")
+            
+            # real conflict window
+            print(f"{name:}: Holding transaction open...")
+            time.sleep(2)
             
             conn.commit()
             print(f"{name}: Successfully committed")
             return True
+            
         except Exception as e:
-            print(f"{name}: FAILED with error: {e}")
+            print(f"{name}: FAILED - {e}")
             conn.rollback()
             return False
         finally:
@@ -279,7 +294,7 @@ def test_concurrent_writes(isolation_level):
         threading.Thread(target=writer_with_conflict, 
                         args=("10.2.14.120", "Writer1-Central", '2024-06-15', 0)),
         threading.Thread(target=writer_with_conflict, 
-                        args=("10.2.14.121", "Writer2-Node2", '2024-08-20', 0.5))
+                        args=("10.2.14.121", "Writer2-Node2", '2024-08-20', 0.3))  # Closer timing
     ]
 
     for w in writers:
@@ -290,8 +305,8 @@ def test_concurrent_writes(isolation_level):
 
     print("\nConcurrent writes completed")
 
-    # check final state on both nodes
-    print("\nChecking final state on all nodes:")
+    # check final state
+    print("\nFinal state across nodes:")
     for host, name in [("10.2.14.120", "Central"), ("10.2.14.121", "Node2"), ("10.2.14.122", "Node3")]:
         database = get_database(host, name)
         conn = connect_node(host, "stadvdb", "Password123!", database)
@@ -300,9 +315,7 @@ def test_concurrent_writes(isolation_level):
             cursor.execute("SELECT deliveryDate FROM FactOrders WHERE orderID = %s", (orderID,))
             result = cursor.fetchone()
             if result:
-                print(f"  {name}: Final delivery date = {result[0]}")
-            else:
-                print(f"  {name}: Record not found")
+                print(f"  {name}: {result[0]}")
             cursor.close()
             conn.close()
 
