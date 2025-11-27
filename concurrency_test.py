@@ -297,6 +297,132 @@ def test_concurrent_writes(isolation_level):
             cursor.close()
             conn.close()
 
+def test_specific_cases(isolation_level):
+    print("\n" + "="*60)
+    print("STEP #3: CONCURRENCY CONTROL")
+    print(f"Isolation Level: {isolation_level}")
+    print("="*60)
+    
+    # Case 1: Concurrent reads on OrderID 61
+    print("\n--- CASE 1: Concurrent reads on OrderID 61 ---")
+    print("Central node and Node 2 reading same data item")
+    
+    def read_order_61(host, name):
+        database = get_database(host, name)
+        conn = connect_node(host, "stadvdb", "Password123!", database)
+        if conn:
+            set_isolation_level(conn, isolation_level)
+            cursor = conn.cursor()
+            cursor.execute("SELECT deliveryDate FROM FactOrders WHERE orderID = 61")
+            result = cursor.fetchone()
+            cursor.close()
+            conn.close()
+            if result:
+                print(f"  {name}: Delivery Date = {result[0]}")
+            else:
+                print(f"  {name}: Order not found")
+    
+    threads = [
+        threading.Thread(target=read_order_61, args=("10.2.14.120", "Central")),
+        threading.Thread(target=read_order_61, args=("10.2.14.121", "Node2"))
+    ]
+    for t in threads: t.start()
+    for t in threads: t.join()
+    
+    # Case 2: Node 3 writing, Central reading OrderID 76
+    print("\n--- CASE 2: Node 3 writing, Central reading OrderID 76 ---")
+    
+    def node3_writer():
+        database = get_database("10.2.14.122", "Node3")
+        conn = connect_node("10.2.14.122", "stadvdb", "Password123!", database)
+        if conn:
+            set_isolation_level(conn, isolation_level)
+            cursor = conn.cursor()
+            conn.start_transaction()
+            print("  Node3: Starting UPDATE on Order 76...")
+            cursor.execute("UPDATE FactOrders SET deliveryDate = '2025-12-25' WHERE orderID = 76")
+            time.sleep(2)  # Give reader time to read during transaction
+            conn.commit()
+            cursor.close()
+            conn.close()
+            print("  Node3: Update committed")
+    
+    def central_reader():
+        time.sleep(1)  # start after writer begins
+        database = get_database("10.2.14.120", "Central")
+        conn = connect_node("10.2.14.120", "stadvdb", "Password123!", database)
+        if conn:
+            set_isolation_level(conn, isolation_level)
+            cursor = conn.cursor()
+            print("  Central: Reading Order 76 during Node3's write...")
+            cursor.execute("SELECT deliveryDate FROM FactOrders WHERE orderID = 76")
+            result = cursor.fetchone()
+            if result:
+                print(f"  Central: Saw delivery date = {result[0]}")
+            cursor.close()
+            conn.close()
+    
+    writer = threading.Thread(target=node3_writer)
+    reader = threading.Thread(target=central_reader)
+    writer.start()
+    reader.start()
+    writer.join()
+    reader.join()
+    
+    # Case 3: Concurrent writes on OrderID 125
+    print("\n--- CASE 3: Concurrent writes on OrderID 125 ---")
+    print("Node 3 and Central both writing")
+    
+    def central_writer():
+        database = get_database("10.2.14.120", "Central")
+        conn = connect_node("10.2.14.120", "stadvdb", "Password123!", database)
+        if conn:
+            set_isolation_level(conn, isolation_level)
+            cursor = conn.cursor()
+            conn.start_transaction()
+            print("  Central: Starting UPDATE to '2024-06-15'...")
+            cursor.execute("UPDATE FactOrders SET deliveryDate = '2024-06-15' WHERE orderID = 125")
+            time.sleep(2)
+            conn.commit()
+            cursor.close()
+            conn.close()
+            print("  Central: Update committed")
+    
+    def node3_writer_125():
+        database = get_database("10.2.14.122", "Node3")
+        conn = connect_node("10.2.14.122", "stadvdb", "Password123!", database)
+        if conn:
+            set_isolation_level(conn, isolation_level)
+            cursor = conn.cursor()
+            conn.start_transaction()
+            print("  Node3: Starting UPDATE to '2025-01-01'...")
+            cursor.execute("UPDATE FactOrders SET deliveryDate = '2025-01-01' WHERE orderID = 125")
+            time.sleep(2)
+            conn.commit()
+            cursor.close()
+            conn.close()
+            print("  Node3: Update committed")
+    
+    writers = [
+        threading.Thread(target=central_writer),
+        threading.Thread(target=node3_writer_125)
+    ]
+    for w in writers: w.start()
+    for w in writers: w.join()
+    
+    print("\nFinal state of Order 125:")
+    for host, name in [("10.2.14.120", "Central"), ("10.2.14.122", "Node3")]:
+        database = get_database(host, name)
+        conn = connect_node(host, "stadvdb", "Password123!", database)
+        if conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT deliveryDate FROM FactOrders WHERE orderID = 125")
+            result = cursor.fetchone()
+            if result:
+                print(f"  {name}: {result[0]}")
+            cursor.close()
+            conn.close()
+            
 def menu():
     isolation_levels = {
         '1': 'READ UNCOMMITTED',
