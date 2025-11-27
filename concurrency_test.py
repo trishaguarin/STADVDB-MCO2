@@ -174,36 +174,34 @@ def test_write_and_reads(isolation_level):
     print("================================================")
 
     orderID = 999999
-    new_date = '2024-12-31'
+    
+    writer_conn = connect_node("10.2.14.120", "stadvdb", "Password123!", "stadvdb_node1")
+    set_isolation_level(writer_conn, isolation_level)
     
     def writer():
-        """Writer that maintains long-running transaction"""
-        database = get_database("10.2.14.120", "central")
-        conn = connect_node("10.2.14.120", "stadvdb", "Password123!", database)
-        set_isolation_level(conn, isolation_level)
-        cursor = conn.cursor()
-        conn.start_transaction()
+        """Writer that maintains long transaction"""
+        cursor = writer_conn.cursor()
+        writer_conn.start_transaction()  # start transaction
         
-        print("WRITER: Starting UPDATE (will delay commit)...")
-        cursor.execute("UPDATE FactOrders SET deliveryDate = %s WHERE orderID = %s", (new_date, orderID))
-        print("WRITER: Update executed, waiting 3 seconds before commit...")
+        print("WRITER: Starting UPDATE (transaction open)...")
+        cursor.execute("UPDATE FactOrders SET deliveryDate = '2024-12-31' WHERE orderID = %s", (orderID,))
+        print("WRITER: Update executed, holding transaction open for 4 seconds...")
         
-        time.sleep(3)  # window for dirty reads
+        time.sleep(4)
         
-        conn.commit()
-        print("WRITER: Committed")
+        writer_conn.commit() 
+        print("WRITER: Transaction COMMITTED")
         cursor.close()
-        conn.close()
     
-    def reader(node_host, node_name, delay=0):
-        """Reader tries to read during writer's transaction"""
+    def reader(node_host, node_name, delay=0, read_twice=False):
+        """Reader that tries to read during uncommitted transaction"""
         time.sleep(delay)
         database = get_database(node_host, node_name)
         conn = connect_node(node_host, "stadvdb", "Password123!", database)
         set_isolation_level(conn, isolation_level)
         cursor = conn.cursor()
         
-        print(f"{node_name}: Attempting to read during write transaction...")
+        print(f"{node_name}: Reading during UNCOMMITTED transaction...")
         try:
             if isolation_level in ['REPEATABLE READ', 'SERIALIZABLE']:
                 conn.start_transaction()
@@ -212,16 +210,14 @@ def test_write_and_reads(isolation_level):
             result = cursor.fetchone()
             
             if result:
-                current_date = result[0]
-                print(f"{node_name}: Saw delivery date = {current_date}")
+                date_seen = result[0]
+                print(f"{node_name}: Saw delivery date = {date_seen}")
                 
                 # detect dirty reads
-                if current_date == new_date and "WRITER: Committed" not in [line for line in open(__file__).readlines() if "WRITER: Committed" in line]:
-                    print(f"*** {node_name}: DIRTY READ DETECTED! ***")
-                elif current_date == new_date:
-                    print(f"{node_name}: Read COMMITTED value")
+                if date_seen == '2024-12-31':
+                    print(f"*** {node_name}: DIRTY READ DETECTED! (saw uncommitted data) ***")
                 else:
-                    print(f"{node_name}: Read previous value (no dirty read)")
+                    print(f"{node_name}: Read committed value: {date_seen}")
             
             if isolation_level in ['REPEATABLE READ', 'SERIALIZABLE']:
                 conn.commit()
@@ -229,26 +225,32 @@ def test_write_and_reads(isolation_level):
         except Exception as e:
             print(f"{node_name}: BLOCKED or ERROR - {e}")
             if isolation_level in ['REPEATABLE READ', 'SERIALIZABLE']:
-                conn.rollback()
+                try:
+                    conn.rollback()
+                except:
+                    pass
         finally:
             cursor.close()
             conn.close()
     
-    writer_thread = threading.Thread(target=writer, name="Writer-Central")
+    writer_thread = threading.Thread(target=writer)
+    
     readers = [
         threading.Thread(target=reader, args=("10.2.14.120", "Reader1-Central", 1)),
-        threading.Thread(target=reader, args=("10.2.14.121", "Reader2-Node2", 1.5)),
-        threading.Thread(target=reader, args=("10.2.14.122", "Reader3-Node3", 2))
+        threading.Thread(target=reader, args=("10.2.14.121", "Reader2-Node2", 2)),
+        threading.Thread(target=reader, args=("10.2.14.122", "Reader3-Node3", 3))
     ]
 
     writer_thread.start()
+    time.sleep(0.5) 
     for r in readers:
         r.start()
 
     writer_thread.join()
     for r in readers:
         r.join()
-
+    
+    writer_conn.close()
     print("\nWrite and read test completed")
 
 def test_concurrent_writes(isolation_level):
@@ -259,8 +261,8 @@ def test_concurrent_writes(isolation_level):
 
     orderID = 999999
 
-    def writer_with_conflict(host, name, new_date, delay=0):
-        """Writer that creates real conflicts"""
+    def writer_with_real_conflict(host, name, new_date, delay=0):
+        """Writer that creates real conflicts on SAME NODE"""
         time.sleep(delay)
         database = get_database(host, name)
         conn = connect_node(host, "stadvdb", "Password123!", database)
@@ -271,30 +273,38 @@ def test_concurrent_writes(isolation_level):
             conn.start_transaction()
             print(f"{name}: Starting UPDATE to {new_date}...")
             
-            cursor.execute("UPDATE FactOrders SET deliveryDate = %s WHERE orderID = %s", (new_date, orderID))
-            print(f"{name}: Update executed, rows affected: {cursor.rowcount}")
+            # read current value first
+            cursor.execute("SELECT deliveryDate FROM FactOrders WHERE orderID = %s", (orderID,))
+            current = cursor.fetchone()
+            print(f"{name}: Current value = {current[0] if current else 'None'}")
             
-            # real conflict window
-            print(f"{name:}: Holding transaction open...")
-            time.sleep(2)
+            # update with conflict
+            cursor.execute("UPDATE FactOrders SET deliveryDate = %s WHERE orderID = %s", (new_date, orderID))
+            affected = cursor.rowcount
+            print(f"{name}: Update executed, rows affected: {affected}")
+            
+            # hold transaction open
+            print(f"{name}: Holding transaction open (potential conflict)...")
+            time.sleep(3)
             
             conn.commit()
             print(f"{name}: Successfully committed")
             return True
             
         except Exception as e:
-            print(f"{name}: FAILED - {e}")
+            print(f"{name}: TRANSACTION FAILED - {e}")
             conn.rollback()
             return False
         finally:
             cursor.close()
             conn.close()
 
+    print("Testing concurrent writes on CENTRAL node:")
     writers = [
-        threading.Thread(target=writer_with_conflict, 
+        threading.Thread(target=writer_with_real_conflict, 
                         args=("10.2.14.120", "Writer1-Central", '2024-06-15', 0)),
-        threading.Thread(target=writer_with_conflict, 
-                        args=("10.2.14.121", "Writer2-Node2", '2024-08-20', 0.3))  # Closer timing
+        threading.Thread(target=writer_with_real_conflict, 
+                        args=("10.2.14.120", "Writer2-Central", '2024-08-20', 1))  # Same node!
     ]
 
     for w in writers:
@@ -306,8 +316,8 @@ def test_concurrent_writes(isolation_level):
     print("\nConcurrent writes completed")
 
     # check final state
-    print("\nFinal state across nodes:")
-    for host, name in [("10.2.14.120", "Central"), ("10.2.14.121", "Node2"), ("10.2.14.122", "Node3")]:
+    print("\nFinal state:")
+    for host, name in [("10.2.14.120", "Central")]:
         database = get_database(host, name)
         conn = connect_node(host, "stadvdb", "Password123!", database)
         if conn:
