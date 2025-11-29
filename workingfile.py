@@ -292,7 +292,7 @@ def detect_non_repeatable_read(order_id, level):
     TO TEST: Open another terminal/device and UPDATE + COMMIT while this transaction is running
     """
     print("\n" + "="*70)
-    print("🔍 NON-REPEATABLE READ DETECTION TEST")
+    print(" NON-REPEATABLE READ DETECTION TEST")
     print("="*70)
     
     if not check_connection(central_node):
@@ -315,7 +315,7 @@ def detect_non_repeatable_read(order_id, level):
         
         first_date = first_read['deliveryDate']
         first_updated = first_read['updatedAt']
-        print(f"📖 First Read (in transaction): Order {order_id}")
+        print(f" First Read (in transaction): Order {order_id}")
         print(f"   Delivery Date: {first_date}")
         print(f"   Updated At: {first_updated}")
         
@@ -393,7 +393,7 @@ def detect_phantom_read(level):
         
         cursor = central_node.cursor(dictionary=True)
         cursor.execute(
-            "SELECT orderID FROM FactOrders WHERE YEAR(deliveryDate) = %s, ORDER BY orderID LIMIT 5",
+            "SELECT orderID FROM FactOrders WHERE YEAR(deliveryDate) = %s ORDER BY orderID LIMIT 5",
             (search_year,)
         )
         first_ids = [row['orderID'] for row in cursor.fetchall()]
