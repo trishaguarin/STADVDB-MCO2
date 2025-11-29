@@ -71,10 +71,43 @@ ISOLATION_LEVELS = {
     "3": "REPEATABLE READ",
     "4": "SERIALIZABLE"
 }
-    
-        
 # ========================================================================
-# 3. PARTITIONING RULE
+# 3. CONCURRENCY WARNING DISPLAY
+# ========================================================================
+def display_isolation_warnings (level, operation_type):
+    """Display warnings about possible concurrency problems for current isolation level"""
+    warnings = {
+        "READ UNCOMMITTED": {
+            "read": ["DIRTY READS possible"],
+            "update": ["NON-REPEATABLES READS possible", "DIRTY READS possible"],
+            "insert": ["PHANTOM READS possible"]
+        },
+        "READ COMMITTED": {
+            "read": ["NON-REPEATABLE READS possible"],
+            "update": ["NON-REPEATABLE READS possible"],
+            "insert": ["PHANTOM READS possible"]
+            
+        },
+        "REPEATABLE READ": {
+            "read": ["DIRTY READS prevented", "NON-REPEATABLE READS prevented"],
+            "update": ["Data consistency maintained within transaction"],
+            "insert": ["PHANTOM READS possible"]
+        },
+        "SERIALIZABLE": {
+            "read": ["All concurrency problems prevented"],
+            "update": ["Complete isolation from other transactions"],
+            "insert": ["Full serializablity guaranteed"]
+        }
+    }
+
+    if level in warnings and operation_type in warnings[level]:
+        print(f"\n Isolation level: {level}")
+        for warning in warnings[level][operation_type]:
+            print(f"    {warning}")
+        print()
+
+# ========================================================================
+# 4. PARTITIONING RULE
 # ========================================================================
 
 def determine_partition_node(delivery_date):
@@ -94,7 +127,7 @@ def determine_partition_node(delivery_date):
 
 
 # ========================================================================
-# 4. REPLICATION HELPERS
+# 5. REPLICATION HELPERS
 # ========================================================================
 
 def replicate_insert_to_central(order_id, delivery_date, level):
@@ -160,16 +193,277 @@ def replicate_insert_to_partition(order_id, delivery_date, level):
             pass
         return False
 
+# ========================================================================
+# 6. AUTOMATIC CONCURRENCY DETECTION IN CRUD
+# ========================================================================
+
+def check_for_phantom_insert(year, level):
+    """Check if phantom reads are possible after insert"""
+    if level in ["READ UNCOMITTED", "READ COMMITTED", "REPEATABLE READ"]:
+        print(f"\n PHANTOM READ WARNING:")
+        print(f"    New order in year {year} could appear as 'phantom row' in concurrent transactions")
+        print(f"    at {level} isolation level")
+
+
+def check_for_non_repeatable_read_update(order_id, old_date, new_date, level):
+    """Check if non-repeatable reads are possible after update"""
+    if level in ["READ UNCOMMITTED", "READ COMMITTED"]:
+        print(f"\n NON-REPEATABLE READ WARNING:")
+        print(f"    Order {order_id} changed from {old_date} to {new_date}")
+        print(f"    Concurrent transactions at {level} may see inconsistent values")
+        
+def check_for_dirty_read_uncommitted(order_id, level):
+    """Warning about dirty reads during uncommitted transactions"""
+    if level == "READ UNCOMMITTED":
+        print(f"\n DIRTY READ WARNING:")
+        print(f"    Other transactions at READ UNCOMMITTED can see uncommitted changes to order {order_id}")
 
 # ========================================================================
-# 5. CRUD OPERATIONS
+# 7. CONTROLLED TEST FUNCTIONS (Menu Options)
+# ========================================================================
+
+def detect_dirty_read(order_id, level):
+    """
+    Controlled test for dirty reads
+    TO TEST: Open another terminal/device and start an UPDATE without committing
+    """
+    print("\n" + "="*70)
+    print("DIRTY READ DETECTION TEST")
+    print("="*70)
+
+    if not check_connection(central_node):
+        print("Central node unavailable")
+        return
+    
+    try:
+        set_isolation_level(central_node, level)
+        cursor = central_node.cursor(dictionary=True)
+        cursor.execute("SELECT deliveryDate, updatedAt FROM FactOrders WHERE orderID = %s", (order_id,))
+        initial_read = cursor.fetchone()
+        cursor.close()
+        
+        if not initial_read:
+            print(f" Order {order_id} not found.")
+            return
+        
+        initial_date = initial_read['deliveryDate']
+        initial_updated = initial_read['updatedAt']
+        print(f" First Read: Order {order_id}")
+        print(f" Delivery Date: {initial_date}")
+        print(f" Updated At: {initial_updated}")
+        
+        print("\n Now update this order in another terminal WITHOUT committing...")
+        print(" Then press ENTER here to read again...")
+        input(" Press ENTER when ready: ")
+        
+        cursor = central_node.cursor(dictionary=True)
+        cursor.execute("SELECT deliveryDate, updatedAt FROM FactOrders WHERE orderID = %s, (order_id,))")
+        second_read = cursor.fetchone()
+        cursor.close()
+        
+        second_date = second_read['deliveryDate'] if second_read else None
+        second_updated = second_read['updatedAt'] if second_read else None
+        
+        print(f"\n Second Read: Order {order_id}")
+        print(f" Delivery Date: {second_date}")
+        print(f" Updated At: {second_updated}")
+
+        if initial_date != second_date or initial_updated != second_updated:
+            print(f"\n DIRTY READ DETECTED!")
+            print(f"    Read uncommitted data from another transaction!")
+        else:
+            print(f"\n No Dirty Read: Data remained consistent")
+        
+        if level == "READ UNCOMMITTED":
+            print(f"\n Isolation Level: {level}")
+            print(f"    This level ALLOWS dirty reads!")
+        else:
+            print(f"\n Isolation level: {level}")
+            print("     This level PREVENTS dirty reads")
+            
+    except Exception as e:
+        print(f" Error: {e}")
+    
+    print("="*70 + "\n")
+
+def detect_non_repeatable_read(order_id, level):
+    """
+    Controlled test for non-repeatable reads
+    TO TEST: Open another terminal/device and UPDATE + COMMIT while this transaction is running
+    """
+    print("\n" + "="*70)
+    print("🔍 NON-REPEATABLE READ DETECTION TEST")
+    print("="*70)
+    
+    if not check_connection(central_node):
+        print(" Central node unavailable")
+        return
+    
+    try:
+        set_isolation_level(central_node, level)
+        central_node.start_transaction()
+        
+        cursor = central_node.cursor(dictionary=True)
+        cursor.execute("SELECT deliveryDate, updatedAt FROM FactOrders WHERE orderID = %s", (order_id,))
+        first_read = cursor.fetchone()
+        cursor.close()
+        
+        if not first_read:
+            central_node.rollback()
+            print(f" Order {order_id} not found.")
+            return
+        
+        first_date = first_read['deliveryDate']
+        first_updated = first_read['updatedAt']
+        print(f"📖 First Read (in transaction): Order {order_id}")
+        print(f"   Delivery Date: {first_date}")
+        print(f"   Updated At: {first_updated}")
+        
+        print("\n Now UPDATE and COMMIT this order in another terminal...")
+        print("   Then press ENTER here to read again (still in same transaction)...")
+        input("   Press ENTER when ready: ")
+        
+        cursor = central_node.cursor(dictionary=True)
+        cursor.execute("SELECT deliveryDate, updatedAt FROM FactOrders WHERE orderID = %s", (order_id,))
+        second_read = cursor.fetchone()
+        cursor.close()
+        
+        second_date = second_read['deliveryDate'] if second_read else None
+        second_updated = second_read['updatedAt'] if second_read else None
+        
+        print(f"\n Second Read (same transaction): Order {order_id}")
+        print(f"   Delivery Date: {second_date}")
+        print(f"   Updated At: {second_updated}")
+        
+        if first_date != second_date or first_updated != second_updated:
+            print(f"\n NON-REPEATABLE READ DETECTED!")
+            print(f"   First Read:  Date={first_date}, Updated={first_updated}")
+            print(f"   Second Read: Date={second_date}, Updated={second_updated}")
+            print(f"   Same query returned different results in the same transaction!")
+        else:
+            print(f"\n No Non-Repeatable Read: Data remained consistent")
+        
+        central_node.rollback()
+        
+        if level in ["READ UNCOMMITTED", "READ COMMITTED"]:
+            print(f"\n Isolation Level: {level}")
+            print("   This level ALLOWS non-repeatable reads!")
+        else:
+            print(f"\n Isolation Level: {level}")
+            print("   This level PREVENTS non-repeatable reads")
+            
+    except Exception as e:
+        print(f" Error: {e}")
+        try:
+            central_node.rollback()
+        except:
+            pass
+    
+    print("="*70 + "\n")
+
+
+def detect_phantom_read(level):
+    """
+    Controlled test for phantom reads
+    TO TEST: Open another terminal/device and INSERT + COMMIT a new order while this transaction is running
+    """
+    print("\n" + "="*70)
+    print("🔍 PHANTOM READ DETECTION TEST")
+    print("="*70)
+    
+    if not check_connection(central_node):
+        print(" Central node unavailable")
+        return
+    
+    try:
+        search_year = input("Enter year to search (e.g., 2024 or 2025): ")
+        
+        set_isolation_level(central_node, level)
+        central_node.start_transaction()
+        
+        cursor = central_node.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT COUNT(*) as count FROM FactOrders WHERE YEAR(deliveryDate) = %s",
+            (search_year,)
+        )
+        first_count = cursor.fetchone()['count']
+        cursor.close()
+        
+        print(f" First Read (in transaction): Found {first_count} orders in year {search_year}")
+        
+        cursor = central_node.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT orderID FROM FactOrders WHERE YEAR(deliveryDate) = %s ORDER BY orderID LIMIT 5",
+            (search_year,)
+        )
+        first_ids = [row['orderID'] for row in cursor.fetchall()]
+        cursor.close()
+        print(f"   Sample Order IDs: {first_ids}")
+        
+        print(f"\n Now INSERT and COMMIT a new order in year {search_year} in another terminal...")
+        print("   Then press ENTER here to read again (still in same transaction)...")
+        input("   Press ENTER when ready: ")
+        
+        cursor = central_node.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT COUNT(*) as count FROM FactOrders WHERE YEAR(deliveryDate) = %s",
+            (search_year,)
+        )
+        second_count = cursor.fetchone()['count']
+        cursor.close()
+        
+        print(f"\n Second Read (same transaction): Found {second_count} orders in year {search_year}")
+        
+        cursor = central_node.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT orderID FROM FactOrders WHERE YEAR(deliveryDate) = %s ORDER BY orderID LIMIT 5",
+            (search_year,)
+        )
+        second_ids = [row['orderID'] for row in cursor.fetchall()]
+        cursor.close()
+        print(f"   Sample Order IDs: {second_ids}")
+        
+        if first_count != second_count:
+            print(f"\n PHANTOM READ DETECTED!")
+            print(f"   First Read:  {first_count} orders")
+            print(f"   Second Read: {second_count} orders")
+            print(f"   New rows appeared in the same transaction (phantom rows)!")
+            
+            new_ids = set(second_ids) - set(first_ids)
+            if new_ids:
+                print(f"   Phantom Order IDs: {list(new_ids)}")
+        else:
+            print(f"\n No Phantom Read: Both reads returned {first_count} orders")
+        
+        central_node.rollback()
+        
+        if level in ["READ UNCOMMITTED", "READ COMMITTED", "REPEATABLE READ"]:
+            print(f"\n Isolation Level: {level}")
+            print("    This level ALLOWS phantom reads!")
+        else:
+            print(f"\n Isolation Level: {level}")
+            print("    This level PREVENTS phantom reads")
+            
+    except Exception as e:
+        print(f" Error: {e}")
+        try:
+            central_node.rollback()
+        except:
+            pass
+    
+    print("="*70 + "\n")
+
+
+# ========================================================================
+# 8. CRUD OPERATIONS
 # ========================================================================
 
 def insert_order(level):
     try:
+        display_isolation_warnings(level, "insert")
+        
         orderID = int(input("Input orderID: "))
 
-        # Check if orderID already exists in central node
         if check_connection(central_node):
             cursor = central_node.cursor()
             cursor.execute("SELECT 1 FROM FactOrders WHERE orderID = %s", (orderID,))
@@ -180,8 +474,8 @@ def insert_order(level):
             cursor.close()
 
         deliveryDate = input("Input Delivery Date (YYYY-MM-DD): ")
+        year = int(deliveryDate[:4])
         
-        # Step 1: Insert into central node first
         if not check_connection(central_node):
             print("Error: Central node unavailable")
             return
@@ -199,11 +493,13 @@ def insert_order(level):
         cursor.close()
         logger.info(f"Inserted order {orderID} into central node")
 
-        # Step 2: Replicate to appropriate partition node
         if not replicate_insert_to_partition(orderID, deliveryDate, level):
             print("Warning: Replication to partition node failed")
         
-        print("Insert and replication successful.\n")
+        print(" Insert and replication successful.\n")
+        
+        # Automatic concurrency detection
+        check_for_phantom_insert(year, level)
 
     except Exception as e:
         logger.error(f"Insert failed: {e}")
@@ -217,34 +513,47 @@ def insert_order(level):
 
 def read_order(level):
     try:
+        display_isolation_warnings(level, "read")
+        
         orderID = int(input("Input orderID: "))
         
         found = False
+        results = {}
         
         for label, node in [("Central", central_node), ("Node2", node2), ("Node3", node3)]:
             if not check_connection(node):
                 print(f"[{label}] Node unavailable")
+                results[label] = None
                 continue
 
             try:
                 set_isolation_level(node, level)
                 cursor = node.cursor(dictionary=True, buffered=True)
-                cursor.execute("SELECT deliveryDate FROM FactOrders WHERE orderID = %s", (orderID,))
+                cursor.execute("SELECT deliveryDate, updatedAt FROM FactOrders WHERE orderID = %s", (orderID,))
                 row = cursor.fetchone()
                 cursor.close()
 
                 if row and row.get('deliveryDate') is not None:
-                    print(f"[{label}] Delivery Date: {row['deliveryDate']}")
+                    print(f"[{label}] Delivery Date: {row['deliveryDate']}, Updated: {row['updatedAt']}")
+                    results[label] = row
                     found = True
                 else:
                     print(f"[{label}] Order not found")
+                    results[label] = None
 
             except Exception as e:
                 logger.error(f"Read from {label} failed: {e}")
                 print(f"[{label}] Read failed")
+                results[label] = None
         
         if not found:
             print("\nOrderID does not exist in any node")
+        
+        # Automatic concurrency detection for READ operations
+        if level in ["READ UNCOMMITTED", "READ COMMITTED"]:
+            print(f"\n  CONCURRENCY NOTE:")
+            print(f"   At {level}, this data could change if you read it again")
+            print(f"   (Non-repeatable read possible)")
             
     except ValueError:
         print("Error: Invalid orderID format")
@@ -252,9 +561,10 @@ def read_order(level):
 
 def update_order(level):
     try:
+        display_isolation_warnings(level, "update")
+        
         orderID = int(input("Input orderID: "))
         
-        # Check if order exists in central node
         if not check_connection(central_node):
             print("Error: Central node unavailable")
             return
@@ -275,15 +585,15 @@ def update_order(level):
         new_delivery_date = input("New Delivery Date (YYYY-MM-DD): ")
         new_year = int(new_delivery_date[:4])
         
-        # Determine old and new partition nodes
         old_partition = determine_partition_node(old_delivery_date)
         new_partition = determine_partition_node(new_delivery_date)
         
-        # Case 1: Year changed (e.g., 2024 to 2025 or vice versa)
+        # Warn about uncommitted changes
+        check_for_dirty_read_uncommitted(orderID, level)
+        
         if old_year != new_year and old_partition and new_partition:
             logger.info(f"Year changed from {old_year} to {new_year}, moving between partitions")
             
-            # Step 1: Insert into new partition node
             if check_connection(new_partition):
                 try:
                     set_isolation_level(new_partition, level)
@@ -301,7 +611,6 @@ def update_order(level):
                     print("Error: Failed to insert into new partition")
                     return
             
-            # Step 2: Delete from old partition node
             if check_connection(old_partition):
                 try:
                     set_isolation_level(old_partition, level)
@@ -313,7 +622,6 @@ def update_order(level):
                 except Exception as e:
                     logger.error(f"Failed to delete from old partition: {e}")
             
-            # Step 3: Update central node
             if check_connection(central_node):
                 try:
                     set_isolation_level(central_node, level)
@@ -331,12 +639,9 @@ def update_order(level):
                     logger.error(f"Failed to update central node: {e}")
                     print("Error: Failed to update central node")
                     return
-        
-        # Case 2: Same year, just update date
         else:
             logger.info(f"Same year update for order {orderID}")
             
-            # Step 1: Update central node
             if check_connection(central_node):
                 try:
                     set_isolation_level(central_node, level)
@@ -355,7 +660,6 @@ def update_order(level):
                     print("Error: Failed to update central node")
                     return
             
-            # Step 2: Update partition node (if exists)
             if new_partition and check_connection(new_partition):
                 try:
                     set_isolation_level(new_partition, level)
@@ -373,7 +677,10 @@ def update_order(level):
                     logger.error(f"Failed to update partition node: {e}")
                     print("Warning: Failed to update partition node")
         
-        print("Update successful.\n")
+        print(" Update successful.\n")
+        
+        # Automatic concurrency detection
+        check_for_non_repeatable_read_update(orderID, old_delivery_date, new_delivery_date, level)
 
     except ValueError:
         print("Error: Invalid input format")
@@ -386,7 +693,6 @@ def delete_order(level):
     try:
         orderID = int(input("Input orderID: "))
         
-        # Check if order exists first
         exists = False
         if check_connection(central_node):
             cursor = central_node.cursor()
@@ -420,56 +726,82 @@ def delete_order(level):
                 except:
                     pass
         
-        print("Delete successful\n")
+        print(" Delete successful\n")
+        
+        if level in ["READ UNCOMMITTED", "READ COMMITTED", "REPEATABLE READ"]:
+            print(f"\n CONCURRENCY NOTE:")
+            print(f"   At {level}, this deletion might affect concurrent transactions")
+            print(f"   reading counts (potential phantom read impact)")
         
     except ValueError:
         print("Error: Invalid orderID format")
 
 
 # ========================================================================
-# 6. MAIN MENU
+# 9. MAIN MENU
 # ========================================================================
 
 def menu():
     while True: 
-        print("\nSELECT ISOLATION LEVEL TO USE\n")
+        print("\n" + "="*70)
+        print("SELECT ISOLATION LEVEL TO USE")
+        print("="*70)
         print("1. READ UNCOMMITTED")
         print("2. READ COMMITTED")
         print("3. REPEATABLE READ")
         print("4. SERIALIZABLE")
     
-        user_input = input("Enter choice: ")
+        user_input = input("\nEnter choice: ")
         if user_input not in ISOLATION_LEVELS:
             print("Invalid choice.")
             continue
         
         level = ISOLATION_LEVELS[user_input]
-        print(f"Using isolation level: {level}\n")        
+        print(f"\n✓ Using isolation level: {level}\n")        
         
+        while True:
+            print("\n" + "="*70)
+            print("MAIN MENU")
+            print("="*70)
+            print("CRUD OPERATIONS (with automatic concurrency detection):")
+            print("1. Insert Order")
+            print("2. Read Order")
+            print("3. Update Order")
+            print("4. Delete Order")
+            print("\nCONTROLLED CONCURRENCY TESTS:")
+            print("5. Test Dirty Read Detection")
+            print("6. Test Non-Repeatable Read Detection")
+            print("7. Test Phantom Read Detection")
+            print("\nOTHER OPTIONS:")
+            print("8. Change Isolation Level")
+            print("9. Exit")
 
-        print("\nMAIN MENU")
-        print("1. Insert")
-        print("2. Read")
-        print("3. Update")
-        print("4. Delete")
-        print("5. Exit")
+            option = input("\nChoose option: ")
 
-        option = input("Choose option: ")
-
-        match option:
-            case '1': 
-                insert_order(level)
-            case '2': 
-                read_order(level)
-            case '3': 
-                update_order(level)
-            case '4': 
-                delete_order(level)
-            case '5':
-                print("Exiting...")
-                break
-            case _: 
-                print("Invalid Choice")
+            match option:
+                case '1': 
+                    insert_order(level)
+                case '2': 
+                    read_order(level)
+                case '3': 
+                    update_order(level)
+                case '4': 
+                    delete_order(level)
+                case '5':
+                    order_id = int(input("Enter orderID to test: "))
+                    detect_dirty_read(order_id, level)
+                case '6':
+                    order_id = int(input("Enter orderID to test: "))
+                    detect_non_repeatable_read(order_id, level)
+                case '7':
+                    detect_phantom_read(level)
+                case '8':
+                    break
+                case '9':
+                    print("\n Exiting... Goodbye!")
+                    return
+                case _: 
+                    print(" Invalid Choice")
 
 if __name__ == "__main__":
     menu()
