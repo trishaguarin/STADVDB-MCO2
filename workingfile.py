@@ -362,13 +362,13 @@ def detect_non_repeatable_read(order_id, level):
     print("="*70 + "\n")
 
 
-def detect_phantom_read_mysql(level):
+def detect_phantom_read(level):
     """
     Controlled test for phantom reads
     TO TEST: Open another terminal/device and INSERT + COMMIT a new order while this transaction is running
     """
     print("\n" + "="*70)
-    print(" PHANTOM READ DETECTION TEST (MySQL Optimized)")
+    print(" PHANTOM READ DETECTION TEST")
     print("="*70)
     
     if not check_connection(central_node):
@@ -383,91 +383,76 @@ def detect_phantom_read_mysql(level):
         
         cursor = central_node.cursor(dictionary=True)
         cursor.execute(
-            "SELECT COUNT(*) as count, MAX(orderID) as max_id, MIN(orderID) as min_id FROM FactOrders WHERE YEAR(deliveryDate) = %s",
+            "SELECT COUNT(*) as count FROM FactOrders WHERE YEAR(deliveryDate) = %s",
             (search_year,)
         )
-        first_stats = cursor.fetchone()
+        first_count = cursor.fetchone()['count']
         cursor.close()
         
-        print(f" First Read (in transaction):")
-        print(f"   Total orders: {first_stats['count']}")
-        print(f"   Min orderID: {first_stats['min_id']}")
-        print(f"   Max orderID: {first_stats['max_id']}")
-        
-        # Get a specific range
-        cursor = central_node.cursor(dictionary=True)
-        cursor.execute(
-            "SELECT COUNT(*) as count FROM FactOrders WHERE YEAR(deliveryDate) = %s AND orderID > %s",
-            (search_year, first_stats['max_id'] - 100)
-        )
-        first_range = cursor.fetchone()['count']
-        cursor.close()
-        print(f"   Orders with ID > {first_stats['max_id'] - 100}: {first_range}")
-        
-        print(f"\n  Now INSERT a new order with a HIGH orderID (e.g., 99999999) in year {search_year}")
-        print("   Use this command in another terminal:")
-        print(f"\n   INSERT INTO FactOrders (orderID, userID, deliveryDate, riderID, createdAt, updatedAt, productID, quantity)")
-        print(f"   VALUES (99999999, 0, '{search_year}-12-31', 0, NOW(), NOW(), 0, 1);")
-        print(f"   COMMIT;\n")
-        input("   Press ENTER when done: ")
+        print(f" First Read (in transaction): Found {first_count} orders in year {search_year}")
         
         cursor = central_node.cursor(dictionary=True)
         cursor.execute(
-            "SELECT COUNT(*) as count, MAX(orderID) as max_id, MIN(orderID) as min_id FROM FactOrders WHERE YEAR(deliveryDate) = %s",
+            "SELECT orderID FROM FactOrders WHERE YEAR(deliveryDate) = %s ORDER BY orderID LIMIT 5",
             (search_year,)
         )
-        second_stats = cursor.fetchone()
+        first_ids = [row['orderID'] for row in cursor.fetchall()]
         cursor.close()
+        print(f"   Sample Order IDs: {first_ids}")
         
-        print(f"\n Second Read (same transaction):")
-        print(f"   Total orders: {second_stats['count']}")
-        print(f"   Min orderID: {second_stats['min_id']}")
-        print(f"   Max orderID: {second_stats['max_id']}")
+        print(f"\n Now INSERT and COMMIT a new order in year {search_year} in another terminal...")
+        print("   Then press ENTER here to read again (still in same transaction)...")
+        input("   Press ENTER when ready: ")
         
         cursor = central_node.cursor(dictionary=True)
         cursor.execute(
-            "SELECT COUNT(*) as count FROM FactOrders WHERE YEAR(deliveryDate) = %s AND orderID > %s",
-            (search_year, first_stats['max_id'] - 100)
+            "SELECT COUNT(*) as count FROM FactOrders WHERE YEAR(deliveryDate) = %s",
+            (search_year,)
         )
-        second_range = cursor.fetchone()['count']
+        second_count = cursor.fetchone()['count']
         cursor.close()
-        print(f"   Orders with ID > {first_stats['max_id'] - 100}: {second_range}")
         
-        # Check for phantom
-        phantom_detected = False
-        if first_stats['count'] != second_stats['count']:
+        print(f"\n Second Read (same transaction): Found {second_count} orders in year {search_year}")
+        
+        cursor = central_node.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT orderID FROM FactOrders WHERE YEAR(deliveryDate) = %s ORDER BY orderID LIMIT 5",
+            (search_year,)
+        )
+        second_ids = [row['orderID'] for row in cursor.fetchall()]
+        cursor.close()
+        print(f"   Sample Order IDs: {second_ids}")
+        
+        if first_count != second_count:
             print(f"\n PHANTOM READ DETECTED!")
-            print(f"   Count changed from {first_stats['count']} to {second_stats['count']}")
-            phantom_detected = True
-        
-        if first_stats['max_id'] != second_stats['max_id']:
-            print(f"\n PHANTOM READ DETECTED!")
-            print(f"   Max ID changed from {first_stats['max_id']} to {second_stats['max_id']}")
-            print(f"   A new high-value order appeared!")
-            phantom_detected = True
-        
-        if first_range != second_range:
-            print(f"\n PHANTOM READ DETECTED!")
-            print(f"   Range count changed from {first_range} to {second_range}")
-            phantom_detected = True
-        
-        if not phantom_detected:
-            print(f"\n No Phantom Read: All statistics remained consistent")
-            print(f"   (Either no insert happened, or isolation level prevented it)")
+            print(f"   First Read:  {first_count} orders")
+            print(f"   Second Read: {second_count} orders")
+            print(f"   New rows appeared in the same transaction (phantom rows)!")
+            
+            new_ids = set(second_ids) - set(first_ids)
+            if new_ids:
+                print(f"   Phantom Order IDs: {list(new_ids)}")
+        else:
+            print(f"\n No Phantom Read: Both reads returned {first_count} orders")
         
         central_node.rollback()
         
-        
+        if level in ["READ UNCOMMITTED", "READ COMMITTED", "REPEATABLE READ"]:
+            print(f"\n Isolation Level: {level}")
+            print("    This level ALLOWS phantom reads!")
+        else:
+            print(f"\n Isolation Level: {level}")
+            print("    This level PREVENTS phantom reads")
+            
     except Exception as e:
         print(f" Error: {e}")
-        import traceback
-        traceback.print_exc()
         try:
             central_node.rollback()
         except:
             pass
     
     print("="*70 + "\n")
+
 
 # ========================================================================
 # 8. CRUD OPERATIONS
