@@ -257,7 +257,7 @@ def detect_dirty_read(order_id, level):
         input(" Press ENTER when ready: ")
         
         cursor = central_node.cursor(dictionary=True)
-        cursor.execute("SELECT deliveryDate, updatedAt FROM FactOrders WHERE orderID = %s, (order_id,))")
+        cursor.execute("SELECT deliveryDate, updatedAt FROM FactOrders WHERE orderID = %s", (order_id,))
         second_read = cursor.fetchone()
         cursor.close()
         
@@ -393,7 +393,7 @@ def detect_phantom_read(level):
         
         cursor = central_node.cursor(dictionary=True)
         cursor.execute(
-            "SELECT orderID FROM FactOrders WHERE YEAR(deliveryDate) = %s ORDER BY orderID LIMIT 5",
+            "SELECT orderID FROM FactOrders WHERE YEAR(deliveryDate) = %s, ORDER BY orderID LIMIT 5",
             (search_year,)
         )
         first_ids = [row['orderID'] for row in cursor.fetchall()]
