@@ -334,6 +334,9 @@ def health_check():
 @app.route('/api/insert', methods=['POST'])
 def insert_order():
     """Insert a new order"""
+
+    start_time = datetime.now()
+
     conn = None
     try:
         data = request.json
@@ -376,11 +379,15 @@ def insert_order():
             year = int(delivery_date[:4])
             phantom_warning = check_for_phantom_insert(year, isolation_level)
             
+            end_time = datetime.now()
+            duration_ms = (end_time - start_time).total_seconds() * 1000
+            
             response = {
                 "success": True,
                 "message": "Order inserted successfully",
                 "order_id": order_id,
                 "replication_status": "success" if replication_success else "partial",
+                "transaction_time_ms": duration_ms,
                 "concurrency_info": {
                     "isolation_warnings": warnings_info,
                     "phantom_warning": phantom_warning
@@ -407,6 +414,7 @@ def insert_order():
 @app.route('/api/read', methods=['POST'])
 def read_order():
     """Read an order from all nodes"""
+    start_time = datetime.now()
     results = {}
     
     try:
@@ -487,12 +495,15 @@ def read_order():
         
         concurrency_note = get_read_concurrency_note(isolation_level)
 
+        end_time = datetime.now()  
+        duration_ms = (end_time - start_time).total_seconds() * 1000
 
         return jsonify({
             "success": True,
             "message": "Order retrieved successfully",
             "order_id": order_id,
             "results": results,
+            "transaction_time_ms": duration_ms,
             "concurrency_info": {
                 "isolation_warnings": warnings_info,
                 "concurrency_note": concurrency_note
@@ -509,6 +520,7 @@ def read_order():
 @app.route('/api/update', methods=['POST'])
 def update_order():
     """Update an order with concurrency detection"""
+    start_time = datetime.now()
     conn_central = None
     conn_old_part = None
     conn_new_part = None
@@ -620,6 +632,9 @@ def update_order():
         non_repeatable_warning = check_for_non_repeatable_read_update(
             order_id, old_delivery_date, new_delivery_date, isolation_level
         )
+
+        end_time = datetime.now()
+        duration_ms = (end_time - start_time).total_seconds() * 1000
         
         return jsonify({
             "success": True,
@@ -627,6 +642,7 @@ def update_order():
             "order_id": order_id,
             "old_date": str(old_delivery_date),
             "new_date": new_delivery_date,
+            "transaction_time_ms": duration_ms,
             "concurrency_info": {
                 "isolation_warnings": warnings_info,
                 "dirty_read_warning": dirty_read_warning,
@@ -647,6 +663,8 @@ def update_order():
 @app.route('/api/delete', methods=['POST'])
 def delete_order():
     """Delete an order from all nodes with concurrency detection"""
+    start_time = datetime.now()
+
     try:
         data = request.json
         order_id = int(data.get('order_id'))
@@ -705,11 +723,15 @@ def delete_order():
         # Get concurrency note
         concurrency_note = get_delete_concurrency_note(isolation_level)
         
+        end_time = datetime.now()
+        duration_ms = (end_time - start_time).total_seconds() * 1000
+
         return jsonify({
             "success": True,
             "message": "Order deleted successfully",
             "order_id": order_id,
             "deletion_results": deletion_results,
+            "transaction_time_ms": duration_ms,
             "concurrency_info": {
                 "concurrency_note": concurrency_note
             }
