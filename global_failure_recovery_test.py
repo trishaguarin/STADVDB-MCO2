@@ -247,40 +247,40 @@ def test_case2():
     print("After recovery: ")
     check_order_location(orderID)
     
-    if __name__ == "__main__":
-        cleanup_test_orders()
-    
-        while True:
-            print("===========================================")
-            print("GLOBAL FAILURE RECOVERY TEST MENU")
-            print("===========================================")
-            print("\n1. Run Case 1 (Replication Failure - Node 2 to Central)")
-            print("2. Run Case 2 (Central Node Recovery)")
-            print("3. Run Case 3 (Replication Failure - Central to Node 2)")
-            print("4. Run Case 4 (Node 2 Recovery)")
-            print("5. Run All Cases")
-            print("6. Cleanup Test Data")
-            print("7. Exit")
-            
-            choice = input("\nChoose option (1-7): ").strip()
-            
-            if choice == '1':
-                test_case1()
-            elif choice == '2':
-                test_case2()
-            elif choice == '3':
-                print("Case 3 not implemented yet")
-            elif choice == '4':
-                print("Case 4 not implemented yet")
-            elif choice == '5':
-                test_case1()
-                input("\nPress ENTER to continue to Case 2...")
-                test_case2()
-                # TODO: case 3 & 4 here
-            elif choice == '6':
-                cleanup_test_orders()
-            elif choice == '7':
-                print("Exiting...")
-                break
-            else:
-                print("Invalid choice. Please try again.")
+if __name__ == "__main__":
+    cleanup_test_orders()
+
+    while True:
+        print("===========================================")
+        print("GLOBAL FAILURE RECOVERY TEST MENU")
+        print("===========================================")
+        print("\n1. Run Case 1 (Replication Failure - Node 2 to Central)")
+        print("2. Run Case 2 (Central Node Recovery)")
+        print("3. Run Case 3 (Replication Failure - Central to Node 2)")
+        print("4. Run Case 4 (Node 2 Recovery)")
+        print("5. Run All Cases")
+        print("6. Cleanup Test Data")
+        print("7. Exit")
+        
+        choice = input("\nChoose option (1-7): ").strip()
+        
+        if choice == '1':
+            test_case1()
+        elif choice == '2':
+            test_case2()
+        elif choice == '3':
+            print("Case 3 not implemented yet")
+        elif choice == '4':
+            print("Case 4 not implemented yet")
+        elif choice == '5':
+            test_case1()
+            input("\nPress ENTER to continue to Case 2...")
+            test_case2()
+            # TODO: case 3 & 4 here
+        elif choice == '6':
+            cleanup_test_orders()
+        elif choice == '7':
+            print("Exiting...")
+            break
+        else:
+            print("Invalid choice. Please try again.")
