@@ -1,9 +1,17 @@
 import mysql.connector
 from mysql.connector import Error
 import logging
+from datetime import datetime, timedelta
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# for tracking when nodes go down
+downtime_tracker = {
+    'Central': None,
+    'Node2': None,
+    'Node3': None
+}
 
 # to connect the nodes
 def connect_node(host, user, password, database, port=3306):
@@ -111,36 +119,35 @@ def check_order_location(orderID):
             # connection failed - node is down
             print(f"  {node_name}: UNAVAILABLE (node is down)")
 
-def copy_missing_to_central():
+def copy_missing_to_central(start_time, end_time):
     """Recovery function: sync missing transactions from node 2 to central"""
-    print("\nRunning recovery: syncing missing data to central...")
-    count_to_copy = 0 # track how many orders to copy back to central
+    print(f"\nRecovering orders from {start_time} to {end_time}...")
     
     conn_node2 = connect_node("10.2.14.121", "stadvdb", "Password123!", "stadvdb_node2")
-    
-    if not conn_node2:
-        logger.error("Failed to connect to Node 2")
-        return False
-    
-    # get all orders
-    cursor_node2 = conn_node2.cursor()
-    cursor_node2.execute("SELECT * FROM FactOrders")
-    all_orders = cursor_node2.fetchall()
-    
-    print(f"Found {len(all_orders)} orders in Node 2")
-    
-    # check each order if it exists in the central node
     conn_central = connect_node("10.2.14.120", "stadvdb", "Password123!", "stadvdb_node1")
     
+    if not conn_node2:
+        print("✗ Error: Cannot connect to Node 2")
+        return
+    
     if not conn_central:
-        print("Error: Cannot connect to Central")
-        cursor_node2.close()
+        print("✗ Error: Cannot connect to Central")
         conn_node2.close()
         return
     
+    cursor_node2 = conn_node2.cursor()
     cursor_central = conn_central.cursor()
     
-    for order in all_orders:
+    cursor_node2.execute("""
+        SELECT * FROM FactOrders 
+        WHERE updatedAt BETWEEN %s AND %s
+        """, (start_time, end_time))
+    
+    orders_during_downtime = cursor_node2.fetchall()
+    print(f"Found {len(orders_during_downtime)} orders during downtime")
+    
+    count_synced = 0
+    for order in orders_during_downtime:
         orderID = order[0]
         
         # check if it exists in central
@@ -148,17 +155,24 @@ def copy_missing_to_central():
         count = cursor_central.fetchone()[0]
         
         if count == 0:
-            # copy to central if order is missing
-            print(f"  Syncing order {orderID} to Central...")
-            
+            # insert missing order
+            print(f"  → Inserting order {orderID}...")
             cursor_central.execute("""
                 INSERT INTO FactOrders 
                 (orderID, userID, deliveryDate, riderID, createdAt, updatedAt, productID, quantity)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             """, order)
-            
-            count_to_copy += 1
-        
+            count_synced += 1
+        else:
+            # order exists but might be outdated -> update it
+            print(f"  → Updating order {orderID}...")
+            cursor_central.execute("""
+                UPDATE FactOrders 
+                SET userID=%s, deliveryDate=%s, riderID=%s, updatedAt=%s, productID=%s, quantity=%s
+                WHERE orderID=%s
+            """, (order[1], order[2], order[3], order[5], order[6], order[7], orderID))
+            count_synced += 1
+    
     conn_central.commit()
     
     cursor_node2.close()
@@ -166,7 +180,7 @@ def copy_missing_to_central():
     conn_node2.close()
     conn_central.close()
         
-    print(f"\nRecovery complete: Synced {count_to_copy} orders to Central")
+    print(f"\nRecovery complete: Synced {count_synced} orders to Central")
     
 def test_case1():
     """
@@ -177,13 +191,17 @@ def test_case1():
     orderID = 999990
     delivery_date = '2024-12-31'
     
-    # insert on Node 2
     print("===========================================")
-    print("CASE 1: ")
+    print("CASE 1: REPLICATION FROM NODE 2 TO CENTRAL")
     print("===========================================")
     
     print("\nStep 1: Inserting order on Node 2...")
     conn = connect_node("10.2.14.121", "stadvdb", "Password123!", "stadvdb_node2")
+    
+    if not conn:
+        print("Error: Cannot connect to Node 2")
+        return
+    
     cursor = conn.cursor()
     
     cursor.execute("""
@@ -195,10 +213,11 @@ def test_case1():
     cursor.close()
     conn.close()
     
-    print(f"Order {orderID} inserted on Node 2.")
+    print(f"Order {orderID} inserted on Node 2")
     
     # replication logic... copy to central
-    print("\nStep 2: Replicating order to the Central Node...")
+    print("\nStep 2: Attempting to replicate to Central...")
+    
     try:
         conn_central = connect_node("10.2.14.120", "stadvdb", "Password123!", "stadvdb_node1")
         
@@ -213,16 +232,22 @@ def test_case1():
             cursor_central.close()
             conn_central.close()
             
-            print("Replication to Central Node: SUCCESSFUL")
+            print("Replication to Central SUCCESSFUL")
             
         else:
-            # when connection fails (central is down)
-            print("Replication to Central Node: FAILED - Central Node unavailable")
+            # record time when central is down
+            downtime_tracker['Central'] = datetime.now()
+            print("Replication FAILED - Central unavailable")
+            print(f"[DETECTED] Central went down at: {downtime_tracker['Central'].strftime('%Y-%m-%d %H:%M:%S')}")
             
     except Exception as e:
-        print(f"Replication to Central Node FAILED - Error: {e}")
-        
+        # record time when central is down
+        downtime_tracker['Central'] = datetime.now()
+        print(f"Replication FAILED - Error: {e}")
+        print(f"[DETECTED] Central went down at: {downtime_tracker['Central'].strftime('%Y-%m-%d %H:%M:%S')}")
+    
     # verify the replicated data exists
+    print("\nStep 3: Verifying data location...")
     check_order_location(orderID)
         
 def test_case2():
@@ -237,19 +262,39 @@ def test_case2():
     orderID = 999990
     
     # check state before recovery
-    print("Before recovery:")
+    print("\nBefore recovery:")
     check_order_location(orderID)
     
-    # run recovery
-    copy_missing_to_central()
+    # check for recorded downtime
+    if downtime_tracker['Central'] is None:
+        print("\nNo recorded downtime for Central.")
+        print("Using fallback: last 1 hour")
+        
+        end_time = datetime.now()
+        start_time = end_time - timedelta(hours=1)
+    else:
+        start_time = downtime_tracker['Central']
+        end_time = datetime.now()
+        
+        print(f"\nUsing detected downtime window:")
+        print(f"  Central went DOWN at: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"  Central came UP at: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    start_str = start_time.strftime('%Y-%m-%d %H:%M:%S')
+    end_str = end_time.strftime('%Y-%m-%d %H:%M:%S')
+    
+    copy_missing_to_central(start_str, end_str)
+    
+    # clear after successful recovery
+    downtime_tracker['Central'] = None
     
     # check state after recovery
-    print("After recovery: ")
+    print("\nAfter recovery:")
     check_order_location(orderID)
     
 if __name__ == "__main__":
     #cleanup_test_orders()
-
+    # TODO: measure time elapsed
     while True:
         print("===========================================")
         print("GLOBAL FAILURE RECOVERY TEST MENU")
