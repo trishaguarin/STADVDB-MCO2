@@ -1,0 +1,286 @@
+import mysql.connector
+from mysql.connector import Error
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# to connect the nodes
+def connect_node(host, user, password, database, port=3306):
+    try:
+        conn = mysql.connector.connect(
+            host=host,
+            user=user,
+            password=password,
+            database=database,
+            port=port
+        )
+        return conn
+    except Error as e:
+        print(f"[ERROR] Cannot connect: {e}")
+        return None
+    
+def check_connection(conn):
+    try:
+        if conn and conn.is_connected():
+            return True
+        return False
+    except:
+        return False
+
+central_node = connect_node(
+    host="10.2.14.120",
+    user="stadvdb",
+    password="Password123!",
+    database="stadvdb_node1"
+)
+node2 = connect_node(
+    host="10.2.14.121",
+    user="stadvdb",
+    password="Password123!",
+    database="stadvdb_node2"
+)
+node3 = connect_node(
+    host="10.2.14.122",
+    user="stadvdb",
+    password="Password123!",
+    database="stadvdb_node3"
+)
+
+def cleanup_test_orders():
+    """Delete test orders from all nodes"""
+    
+    # list of order ids to test
+    test_order_ids = [999990, 999991, 999992, 999993]
+    
+    nodes = [
+        ("10.2.14.120", "stadvdb", "Password123!", "stadvdb_node1", "Central"),
+        ("10.2.14.121", "stadvdb", "Password123!", "stadvdb_node2", "Node2"),
+        ("10.2.14.122", "stadvdb", "Password123!", "stadvdb_node3", "Node3")
+    ]
+    
+    print("Cleaning up test orders from all nodes...")
+    
+    for host, user, password, database, node_name in nodes:
+        conn = connect_node(host, user, password, database)
+        
+        if conn:
+            cursor = conn.cursor()
+            
+            for order_id in test_order_ids:
+                cursor.execute("DELETE FROM FactOrders WHERE orderID = %s", (order_id,))
+            
+            conn.commit()
+            print(f"Cleaned {node_name}")
+            
+            cursor.close()
+            conn.close()
+        else:
+            print(f"Could not connect to {node_name}")
+    
+    print("Cleanup complete!\n")
+
+    
+def check_order_location(orderID):
+    """Check which nodes contain an order""" 
+    print(f"\nChecking location of order {orderID}:")
+    
+    nodes = [
+        ("10.2.14.120", "stadvdb_node1", "Central"),
+        ("10.2.14.121", "stadvdb_node2", "Node2"),
+        ("10.2.14.122", "stadvdb_node3", "Node3")
+    ]
+    
+    for host, database, node_name in nodes:
+        conn = connect_node(host, "stadvdb", "Password123!", database)
+        
+        if conn:
+            cursor = conn.cursor()
+            
+            cursor.execute("SELECT COUNT(*) FROM FactOrders WHERE orderID = %s", (orderID,))
+            count = cursor.fetchone()[0]  # get count
+            
+            if count > 0:
+                print(f"  {node_name}: EXISTS")
+            else:
+                print(f"  {node_name}: MISSING")
+            
+            cursor.close()
+            conn.close()
+        else:
+            # connection failed - node is down
+            print(f"  {node_name}: UNAVAILABLE (node is down)")
+
+def copy_missing_to_central():
+    """Recovery function: sync missing transactions from node 2 to central"""
+    print("\nRunning recovery: syncing missing data to central...")
+    count_to_copy = 0 # track how many orders to copy back to central
+    
+    conn_node2 = connect_node("10.2.14.121", "stadvdb", "Password123!", "stadvdb_node2")
+    
+    if not conn_node2:
+        logger.error("Failed to connect to Node 2")
+        return False
+    
+    # get all orders
+    cursor_node2 = conn_node2.cursor()
+    cursor_node2.execute("SELECT * FROM FactOrders")
+    all_orders = cursor_node2.fetchall()
+    
+    print(f"Found {len(all_orders)} orders in Node 2")
+    
+    # check each order if it exists in the central node
+    conn_central = connect_node("10.2.14.120", "stadvdb", "Password123!", "stadvdb_node1")
+    
+    if not conn_central:
+        print("Error: Cannot connect to Central")
+        cursor_node2.close()
+        conn_node2.close()
+        return
+    
+    cursor_central = conn_central.cursor()
+    
+    for order in all_orders:
+        orderID = order[0]
+        
+        # check if it exists in central
+        cursor_central.execute("SELECT COUNT(*) FROM FactOrders WHERE orderID = %s", (orderID,))
+        count = cursor_central.fetchone()[0]
+        
+        if count == 0:
+            # copy to central if order is missing
+            print(f"  Syncing order {orderID} to Central...")
+            
+            cursor_central.execute("""
+                INSERT INTO FactOrders 
+                (orderID, userID, deliveryDate, riderID, createdAt, updatedAt, productID, quantity)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            """, order)
+            
+            count_to_copy += 1
+        
+    conn_central.commit()
+    
+    cursor_node2.close()
+    cursor_central.close()
+    conn_node2.close()
+    conn_central.close()
+        
+    print(f"\nRecovery complete: Synced {count_to_copy} orders to Central")
+    
+def test_case1():
+    """
+    Case 1: When attempting to replicate the transaction from Node 2 or Node 3 to the central node, 
+    the transaction fails in writing (insert / update) to the central node.
+    """
+    
+    orderID = 999990
+    delivery_date = '2024-12-31'
+    
+    # insert on Node 2
+    print("===========================================")
+    print("CASE 1: ")
+    print("===========================================")
+    
+    print("\nStep 1: Inserting order on Node 2...")
+    conn = connect_node("10.2.14.121", "stadvdb", "Password123!", "stadvdb_node2")
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        INSERT INTO FactOrders (orderID, userID, deliveryDate, riderID, createdAt, updatedAt, productID, quantity)
+        VALUES (%s, 0, %s, 0, NOW(), NOW(), 0, 1) 
+    """, (orderID, delivery_date))
+    
+    conn.commit()
+    cursor.close()
+    conn.close()
+    
+    print(f"Order {orderID} inserted on Node 2.")
+    
+    # replication logic... copy to central
+    print("\nStep 2: Replicating order to the Central Node...")
+    try:
+        conn_central = connect_node("10.2.14.120", "stadvdb", "Password123!", "stadvdb_node1")
+        
+        if conn_central:
+            cursor_central = conn_central.cursor()
+            cursor_central.execute("""
+                INSERT INTO FactOrders (orderID, userID, deliveryDate, riderID, createdAt, updatedAt, productID, quantity)
+                VALUES (%s, 0, %s, 0, NOW(), NOW(), 0, 1)
+            """, (orderID, delivery_date))
+            
+            conn_central.commit()
+            cursor_central.close()
+            conn_central.close()
+            
+            print("Replication to Central Node: SUCCESSFUL")
+            
+        else:
+            # when connection fails (central is down)
+            print("Replication to Central Node: FAILED - Central Node unavailable")
+            
+    except Exception as e:
+        print(f"Replication to Central Node FAILED - Error: {e}")
+        
+    # verify the replicated data exists
+    check_order_location(orderID)
+        
+def test_case2():
+    """
+    Case 2: The central node eventually recovers from failure (i.e., comes back online) 
+    and missed certain write (insert / update) transactions.
+    """
+    print("===========================================")
+    print("CASE 2: Central Node recovers missing data")
+    print("===========================================")
+    
+    orderID = 999990
+    
+    # check state before recovery
+    print("Before recovery:")
+    check_order_location(orderID)
+    
+    # run recovery
+    copy_missing_to_central()
+    
+    # check state after recovery
+    print("After recovery: ")
+    check_order_location(orderID)
+    
+    if __name__ == "__main__":
+        cleanup_test_orders()
+    
+        while True:
+            print("===========================================")
+            print("GLOBAL FAILURE RECOVERY TEST MENU")
+            print("===========================================")
+            print("\n1. Run Case 1 (Replication Failure - Node 2 to Central)")
+            print("2. Run Case 2 (Central Node Recovery)")
+            print("3. Run Case 3 (Replication Failure - Central to Node 2)")
+            print("4. Run Case 4 (Node 2 Recovery)")
+            print("5. Run All Cases")
+            print("6. Cleanup Test Data")
+            print("7. Exit")
+            
+            choice = input("\nChoose option (1-7): ").strip()
+            
+            if choice == '1':
+                test_case1()
+            elif choice == '2':
+                test_case2()
+            elif choice == '3':
+                print("Case 3 not implemented yet")
+            elif choice == '4':
+                print("Case 4 not implemented yet")
+            elif choice == '5':
+                test_case1()
+                input("\nPress ENTER to continue to Case 2...")
+                test_case2()
+                # TODO: case 3 & 4 here
+            elif choice == '6':
+                cleanup_test_orders()
+            elif choice == '7':
+                print("Exiting...")
+                break
+            else:
+                print("Invalid choice. Please try again.")
