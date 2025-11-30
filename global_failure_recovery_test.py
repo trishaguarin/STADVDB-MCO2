@@ -191,7 +191,7 @@ def copy_missing_to_central(start_time, end_time):
 
 def copy_missing_to_node2(start_time, end_time):
     """Recovery function: sync missing transactions from central to node 2"""
-    print(f"\nRecovering orders from {start_time} to {end_time} to Node 2...")
+    print(f"\nRecovering 2024 orders from {start_time} to {end_time} to Node 2...")
     
     conn_central = connect_node("10.2.14.120", "stadvdb", "Password123!", "stadvdb_node1")
     conn_node2 = connect_node("10.2.14.121", "stadvdb", "Password123!", "stadvdb_node2")
@@ -207,7 +207,7 @@ def copy_missing_to_node2(start_time, end_time):
     
     cursor_central = conn_central.cursor()
     cursor_node2 = conn_node2.cursor()
-    
+
     # orders from central that should be in node 2
     cursor_central.execute("""
         SELECT * FROM FactOrders 
@@ -218,34 +218,40 @@ def copy_missing_to_node2(start_time, end_time):
     orders_during_downtime = cursor_central.fetchall()
     print(f"Found {len(orders_during_downtime)} 2024 orders during downtime")
     
+    processed_orders = set()
     count_synced = 0
+    
     for order in orders_during_downtime:
         orderID = order[0]
-        delivery_date = order[2]
         
-        # only process 2024 orders
-        if str(delivery_date).startswith('2024'):
-            cursor_node2.execute("SELECT COUNT(*) FROM FactOrders WHERE orderID = %s", (orderID,))
-            count = cursor_node2.fetchone()[0]
+        # skip if already processed
+        if orderID in processed_orders:
+            continue
             
-            if count == 0:
-                # insert the missing order
-                print(f"  -> Inserting order {orderID} to Node 2...")
-                cursor_node2.execute("""
-                    INSERT INTO FactOrders 
-                    (orderID, userID, deliveryDate, riderID, createdAt, updatedAt, productID, quantity)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                """, order)
-                count_synced += 1
-            else:
-                # update if outdated
-                print(f"  -> Updating order {orderID} in Node 2...")
-                cursor_node2.execute("""
-                    UPDATE FactOrders 
-                    SET userID=%s, deliveryDate=%s, riderID=%s, updatedAt=%s, productID=%s, quantity=%s
-                    WHERE orderID=%s
-                """, (order[1], order[2], order[3], order[5], order[6], order[7], orderID))
-                count_synced += 1
+        processed_orders.add(orderID)
+
+        # only process 2024 orders
+        cursor_node2.execute("SELECT COUNT(*) FROM FactOrders WHERE orderID = %s", (orderID,))
+        count = cursor_node2.fetchone()[0]
+        
+        if count == 0:
+            # insert the missing order
+            print(f"  -> Inserting order {orderID} to Node 2...")
+            cursor_node2.execute("""
+                INSERT INTO FactOrders 
+                (orderID, userID, deliveryDate, riderID, createdAt, updatedAt, productID, quantity)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            """, order)
+            count_synced += 1
+        else:
+            # update if outdated
+            print(f"  -> Updating order {orderID} in Node 2...")
+            cursor_node2.execute("""
+                UPDATE FactOrders 
+                SET userID=%s, deliveryDate=%s, riderID=%s, updatedAt=%s, productID=%s, quantity=%s
+                WHERE orderID=%s
+            """, (order[1], order[2], order[3], order[5], order[6], order[7], orderID))
+            count_synced += 1
     
     conn_node2.commit()
     
@@ -255,7 +261,7 @@ def copy_missing_to_node2(start_time, end_time):
     conn_node2.close()
         
     print(f"\nRecovery complete: Synced {count_synced} orders to Node 2")
-    
+
 def test_case1():
     """
     Case 1: When attempting to replicate the transaction from Node 2 or Node 3 to the central node, 
