@@ -145,10 +145,17 @@ def copy_missing_to_central(start_time, end_time):
     
     orders_during_downtime = cursor_node2.fetchall()
     print(f"Found {len(orders_during_downtime)} orders during downtime")
-    
+
+    processed_orders = set()
     count_synced = 0
     for order in orders_during_downtime:
         orderID = order[0]
+
+        # skip if already processed
+        if orderID in processed_orders:
+            continue
+
+        processed_orders.add(orderID)
         
         # check if it exists in central
         cursor_central.execute("SELECT COUNT(*) FROM FactOrders WHERE orderID = %s", (orderID,))
@@ -425,6 +432,47 @@ def test_case3():
     # verify data location
     print("\nStep 3: Verifying data location...")
     check_order_location(orderID)
+
+def test_case4():
+    """
+    Case 4: Node 2 eventually recovers from failure and missed certain write transactions.
+    """
+    print("===========================================")
+    print("CASE 4: Node 2 Recovery")
+    print("===========================================")
+    
+    orderID = 999991
+    
+    # check state before recovery
+    print("\nBefore recovery:")
+    check_order_location(orderID)
+    
+    # check for recorded downtime
+    if downtime_tracker['Node2'] is None:
+        print("\nNo recorded downtime for Node 2.")
+        print("Using fallback: last 1 hour")
+        
+        end_time = datetime.now()
+        start_time = end_time - timedelta(hours=1)
+    else:
+        start_time = downtime_tracker['Node2']
+        end_time = datetime.now()
+        
+        print(f"\nUsing detected downtime window:")
+        print(f"  Node 2 went DOWN at: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"  Node 2 came UP at: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    start_str = start_time.strftime('%Y-%m-%d %H:%M:%S')
+    end_str = end_time.strftime('%Y-%m-%d %H:%M:%S')
+    
+    copy_missing_to_node2(start_str, end_str)
+    
+    # clear after successful recovery
+    downtime_tracker['Node2'] = None
+    
+    # check state after recovery
+    print("\nAfter recovery:")
+    check_order_location(orderID)
     
 if __name__ == "__main__":
     #cleanup_test_orders()
@@ -450,12 +498,15 @@ if __name__ == "__main__":
         elif choice == '3':
             test_case3()
         elif choice == '4':
-            print("Case 4 not implemented yet")
+            test_case4()
         elif choice == '5':
             test_case1()
             input("\nPress ENTER to continue to Case 2...")
             test_case2()
-            # TODO: case 3 & 4 here
+            input("\nPress ENTER to continue to Case 3...")
+            test_case3()
+            input("\nPress ENTER to continue to Case 4...")
+            test_case4()
         elif choice == '6':
             cleanup_test_orders()
         elif choice == '7':
