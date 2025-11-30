@@ -56,11 +56,18 @@ const ConcurrencyWarnings = ({ concurrencyInfo }) => {
 const formatResponse = (response, operation) => {
   if (!response) return null;
 
+  const transactionTimeDisplay = response.transaction_time_ms ? (
+    <div className="transaction-time">
+      <strong>Transaction Time:</strong> {response.transaction_time_ms.toFixed(2)} ms
+    </div>
+  ) : null;
+
   if (operation === 'read' && response.results) {
     return (
       <div className="read-response">
-
-        {/* NEW — show warnings for READ operations */}
+        {transactionTimeDisplay}
+        
+        {/* Show warnings for READ operations */}
         {response.concurrency_info && (
           <ConcurrencyWarnings concurrencyInfo={response.concurrency_info} />
         )}
@@ -112,8 +119,9 @@ const formatResponse = (response, operation) => {
   if (response.message) {
     return (
     <div className="operation-response">
-
-      {/* NEW: Show concurrency warnings */}
+      {transactionTimeDisplay}
+      
+      {/* Show concurrency warnings */}
       {response.concurrency_info && (
         <ConcurrencyWarnings concurrencyInfo={response.concurrency_info} />
       )}
