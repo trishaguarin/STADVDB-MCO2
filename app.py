@@ -17,7 +17,6 @@ CORS(app)
 # DATABASE CONNECTION
 # ========================================================================
 
-# Connection pool configuration
 POOL_SIZE = 5
 POOL_RESET_SESSION = True
 
@@ -118,6 +117,87 @@ def set_isolation_level(conn, level):
         return False
 
 # ========================================================================
+# CONCURRENCY WARNING FUNCTIONS
+# ========================================================================
+
+def get_isolation_warnings(level, operation_type):
+    """Get warnings about possible concurrency problems for current isolation level"""
+    warnings = {
+        "READ UNCOMMITTED": {
+            "read": ["DIRTY READS possible"],
+            "update": ["NON-REPEATABLE READS possible", "DIRTY READS possible"],
+            "insert": ["PHANTOM READS possible"]
+        },
+        "READ COMMITTED": {
+            "read": ["NON-REPEATABLE READS possible"],
+            "update": ["NON-REPEATABLE READS possible"],
+            "insert": ["PHANTOM READS possible"]
+        },
+        "REPEATABLE READ": {
+            "read": ["DIRTY READS prevented", "NON-REPEATABLE READS prevented"],
+            "update": ["Data consistency maintained within transaction"],
+            "insert": ["PHANTOM READS possible"]
+        },
+        "SERIALIZABLE": {
+            "read": ["All concurrency problems prevented"],
+            "update": ["Complete isolation from other transactions"],
+            "insert": ["Full serializability guaranteed"]
+        }
+    }
+    
+    if level in warnings and operation_type in warnings[level]:
+        return {
+            "isolation_level": level,
+            "warnings": warnings[level][operation_type]
+        }
+    return None
+
+def check_for_phantom_insert(year, level):
+    """Check if phantom reads are possible after insert"""
+    if level in ["READ UNCOMMITTED", "READ COMMITTED", "REPEATABLE READ"]:
+        return {
+            "type": "PHANTOM READ WARNING",
+            "message": f"New order in year {year} could appear as 'phantom row' in concurrent transactions at {level} isolation level"
+        }
+    return None
+
+def check_for_non_repeatable_read_update(order_id, old_date, new_date, level):
+    """Check if non-repeatable reads are possible after update"""
+    if level in ["READ UNCOMMITTED", "READ COMMITTED"]:
+        return {
+            "type": "NON-REPEATABLE READ WARNING",
+            "message": f"Order {order_id} changed from {old_date} to {new_date}. Concurrent transactions at {level} may see inconsistent values"
+        }
+    return None
+
+def check_for_dirty_read_uncommitted(order_id, level):
+    """Warning about dirty reads during uncommitted transactions"""
+    if level == "READ UNCOMMITTED":
+        return {
+            "type": "DIRTY READ WARNING",
+            "message": f"Other transactions at READ UNCOMMITTED can see uncommitted changes to order {order_id}"
+        }
+    return None
+
+def get_read_concurrency_note(level):
+    """Get concurrency note for read operations"""
+    if level in ["READ UNCOMMITTED", "READ COMMITTED"]:
+        return {
+            "type": "CONCURRENCY NOTE",
+            "message": f"At {level}, this data could change if you read it again (Non-repeatable read possible)"
+        }
+    return None
+
+def get_delete_concurrency_note(level):
+    """Get concurrency note for delete operations"""
+    if level in ["READ UNCOMMITTED", "READ COMMITTED", "REPEATABLE READ"]:
+        return {
+            "type": "CONCURRENCY NOTE",
+            "message": f"At {level}, this deletion might affect concurrent transactions reading counts (potential phantom read impact)"
+        }
+    return None
+
+# ========================================================================
 # PARTITIONING LOGIC
 # ========================================================================
 
@@ -153,12 +233,10 @@ def replicate_insert_to_central(order_id, delivery_date, level):
             return False
             
         cursor = conn.cursor()
-        
         sql = """
         INSERT INTO FactOrders (orderID, userID, deliveryDate, riderID, createdAt, updatedAt, productID, quantity)
         VALUES (%s, 0, %s, 0, NOW(), NOW(), 0, 1)
         """
-        
         cursor.execute(sql, (order_id, delivery_date))
         conn.commit()
         cursor.close()
@@ -210,12 +288,10 @@ def replicate_insert_to_partition(order_id, delivery_date, level):
             return False
             
         cursor = conn.cursor()
-        
         sql = """
         INSERT INTO FactOrders (orderID, userID, deliveryDate, riderID, createdAt, updatedAt, productID, quantity)
         VALUES (%s, 0, %s, 0, NOW(), NOW(), 0, 1)
         """
-        
         cursor.execute(sql, (order_id, delivery_date))
         conn.commit()
         cursor.close()
@@ -238,7 +314,6 @@ def replicate_insert_to_partition(order_id, delivery_date, level):
 # ========================================================================
 
 @app.route('/api/health', methods=['GET'])
-@app.route('/api/health', methods=['GET'])
 def health_check():
     """Health check endpoint"""
     return jsonify({
@@ -252,7 +327,7 @@ def health_check():
 
 @app.route('/api/insert', methods=['POST'])
 def insert_order():
-    """Insert a new order"""
+    """Insert a new order with concurrency detection"""
     conn = None
     try:
         data = request.json
@@ -262,6 +337,9 @@ def insert_order():
         
         if not order_id or not delivery_date:
             return jsonify({"error": "Missing required fields"}), 400
+        
+        # Get isolation warnings
+        warnings_info = get_isolation_warnings(isolation_level, "insert")
         
         try:
             conn = central_pool.get_connection()
@@ -281,7 +359,6 @@ def insert_order():
             INSERT INTO FactOrders (orderID, userID, deliveryDate, riderID, createdAt, updatedAt, productID, quantity)
             VALUES (%s, 0, %s, 0, NOW(), NOW(), 0, 1)
             """
-            
             cursor.execute(sql, (order_id, delivery_date))
             conn.commit()
             cursor.close()
@@ -289,12 +366,22 @@ def insert_order():
             
             replication_success = replicate_insert_to_partition(order_id, delivery_date, isolation_level)
             
-            return jsonify({
+            # Check for concurrency issues
+            year = int(delivery_date[:4])
+            phantom_warning = check_for_phantom_insert(year, isolation_level)
+            
+            response = {
                 "success": True,
                 "message": "Order inserted successfully",
                 "order_id": order_id,
-                "replication_status": "success" if replication_success else "partial"
-            }), 201
+                "replication_status": "success" if replication_success else "partial",
+                "concurrency_info": {
+                    "isolation_warnings": warnings_info,
+                    "phantom_warning": phantom_warning
+                }
+            }
+            
+            return jsonify(response), 201
             
         except Error as e:
             logger.error(f"Database error: {e}")
@@ -313,7 +400,7 @@ def insert_order():
 
 @app.route('/api/read', methods=['POST'])
 def read_order():
-    """Read an order from all nodes"""
+    """Read an order from all nodes with concurrency detection"""
     results = {}
     
     try:
@@ -324,9 +411,10 @@ def read_order():
         if not order_id:
             return jsonify({"error": "Missing order_id"}), 400
         
-        found = False
+        # Get isolation warnings
+        warnings_info = get_isolation_warnings(isolation_level, "read")
         
-        # Check all nodes
+        found = False
         nodes = [
             ("central", central_pool),
             ("node2", node2_pool),
@@ -342,7 +430,6 @@ def read_order():
                     continue
                             
                 cursor = conn.cursor(dictionary=True)
-                # For central node, only select orderID and deliveryDate
                 if label == "central":
                     cursor.execute(
                         "SELECT orderID, deliveryDate FROM FactOrders WHERE orderID = %s",
@@ -390,11 +477,18 @@ def read_order():
                 "results": results
             }), 404
         
+        # Get concurrency note
+        concurrency_note = get_read_concurrency_note(isolation_level)
+        
         return jsonify({
             "success": True,
             "message": "Order retrieved successfully",
             "order_id": order_id,
-            "results": results
+            "results": results,
+            "concurrency_info": {
+                "isolation_warnings": warnings_info,
+                "concurrency_note": concurrency_note
+            }
         }), 200
         
     except ValueError:
@@ -402,11 +496,10 @@ def read_order():
     except Exception as e:
         logger.exception(f"Read failed: {e}")
         return jsonify({"error": "An unexpected error occurred"}), 500
-    
-    
+
 @app.route('/api/update', methods=['POST'])
 def update_order():
-    """Update an order"""
+    """Update an order with concurrency detection"""
     conn_central = None
     conn_old_part = None
     conn_new_part = None
@@ -419,6 +512,9 @@ def update_order():
         
         if not order_id or not new_delivery_date:
             return jsonify({"error": "Missing required fields"}), 400
+        
+        # Get isolation warnings
+        warnings_info = get_isolation_warnings(isolation_level, "update")
         
         try:
             conn_central = central_pool.get_connection()
@@ -439,6 +535,9 @@ def update_order():
         old_delivery_date = result[0]
         old_year = int(str(old_delivery_date)[:4])
         new_year = int(new_delivery_date[:4])
+        
+        # Check for dirty read warning
+        dirty_read_warning = check_for_dirty_read_uncommitted(order_id, isolation_level)
         
         old_partition = determine_partition_node(old_delivery_date)
         new_partition = determine_partition_node(new_delivery_date)
@@ -508,12 +607,22 @@ def update_order():
                 if conn_part and conn_part.is_connected():
                     conn_part.rollback()
         
+        # Check for non-repeatable read warning
+        non_repeatable_warning = check_for_non_repeatable_read_update(
+            order_id, old_delivery_date, new_delivery_date, isolation_level
+        )
+        
         return jsonify({
             "success": True,
             "message": "Order updated successfully",
             "order_id": order_id,
             "old_date": str(old_delivery_date),
-            "new_date": new_delivery_date
+            "new_date": new_delivery_date,
+            "concurrency_info": {
+                "isolation_warnings": warnings_info,
+                "dirty_read_warning": dirty_read_warning,
+                "non_repeatable_warning": non_repeatable_warning
+            }
         }), 200
         
     except ValueError:
@@ -528,7 +637,7 @@ def update_order():
 
 @app.route('/api/delete', methods=['POST'])
 def delete_order():
-    """Delete an order from all nodes"""
+    """Delete an order from all nodes with concurrency detection"""
     try:
         data = request.json
         order_id = int(data.get('order_id'))
@@ -584,11 +693,17 @@ def delete_order():
                 if conn and conn.is_connected():
                     conn.close()
         
+        # Get concurrency note
+        concurrency_note = get_delete_concurrency_note(isolation_level)
+        
         return jsonify({
             "success": True,
             "message": "Order deleted successfully",
             "order_id": order_id,
-            "deletion_results": deletion_results
+            "deletion_results": deletion_results,
+            "concurrency_info": {
+                "concurrency_note": concurrency_note
+            }
         }), 200
         
     except ValueError:
@@ -596,6 +711,144 @@ def delete_order():
     except Exception as e:
         logger.exception(f"Delete failed: {e}")
         return jsonify({"error": "An unexpected error occurred"}), 500
+
+# ========================================================================
+# CONCURRENCY TEST ENDPOINTS
+# ========================================================================
+
+@app.route('/api/test/dirty-read', methods=['POST'])
+def test_dirty_read():
+    """Endpoint for testing dirty reads"""
+    try:
+        data = request.json
+        order_id = int(data.get('order_id'))
+        isolation_level = data.get('isolation_level', 'READ UNCOMMITTED')
+        step = data.get('step', 'first')  # 'first' or 'second'
+        
+        if not central_pool:
+            return jsonify({"error": "Central node unavailable"}), 503
+        
+        with get_connection(central_pool) as conn:
+            set_isolation_level(conn, isolation_level)
+            cursor = conn.cursor(dictionary=True)
+            cursor.execute("SELECT deliveryDate, updatedAt FROM FactOrders WHERE orderID = %s", (order_id,))
+            result = cursor.fetchone()
+            cursor.close()
+            
+            if not result:
+                return jsonify({"error": f"Order {order_id} not found"}), 404
+            
+            for key, value in result.items():
+                if hasattr(value, 'isoformat'):
+                    result[key] = value.isoformat()
+            
+            return jsonify({
+                "success": True,
+                "step": step,
+                "order_id": order_id,
+                "data": result,
+                "isolation_level": isolation_level,
+                "instructions": "Update this order in another session WITHOUT committing, then read again"
+            }), 200
+            
+    except Exception as e:
+        logger.exception(f"Dirty read test failed: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/test/non-repeatable-read', methods=['POST'])
+def test_non_repeatable_read():
+    """Endpoint for testing non-repeatable reads"""
+    try:
+        data = request.json
+        order_id = int(data.get('order_id'))
+        isolation_level = data.get('isolation_level', 'READ COMMITTED')
+        action = data.get('action', 'start')  # 'start', 'read', or 'end'
+        
+        if not central_pool:
+            return jsonify({"error": "Central node unavailable"}), 503
+        
+        with get_connection(central_pool) as conn:
+            set_isolation_level(conn, isolation_level)
+            
+            if action == 'start':
+                conn.start_transaction()
+            
+            cursor = conn.cursor(dictionary=True)
+            cursor.execute("SELECT deliveryDate, updatedAt FROM FactOrders WHERE orderID = %s", (order_id,))
+            result = cursor.fetchone()
+            cursor.close()
+            
+            if action == 'end':
+                conn.rollback()
+            
+            if not result:
+                return jsonify({"error": f"Order {order_id} not found"}), 404
+            
+            for key, value in result.items():
+                if hasattr(value, 'isoformat'):
+                    result[key] = value.isoformat()
+            
+            return jsonify({
+                "success": True,
+                "action": action,
+                "order_id": order_id,
+                "data": result,
+                "isolation_level": isolation_level,
+                "instructions": "UPDATE and COMMIT this order in another session between reads"
+            }), 200
+            
+    except Exception as e:
+        logger.exception(f"Non-repeatable read test failed: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/test/phantom-read', methods=['POST'])
+def test_phantom_read():
+    """Endpoint for testing phantom reads"""
+    try:
+        data = request.json
+        year = int(data.get('year', 2024))
+        isolation_level = data.get('isolation_level', 'REPEATABLE READ')
+        action = data.get('action', 'start')  # 'start', 'read', or 'end'
+        
+        if not central_pool:
+            return jsonify({"error": "Central node unavailable"}), 503
+        
+        with get_connection(central_pool) as conn:
+            set_isolation_level(conn, isolation_level)
+            
+            if action == 'start':
+                conn.start_transaction()
+            
+            cursor = conn.cursor(dictionary=True)
+            cursor.execute(
+                "SELECT COUNT(*) as count FROM FactOrders WHERE YEAR(deliveryDate) = %s",
+                (year,)
+            )
+            count_result = cursor.fetchone()
+            
+            cursor.execute(
+                "SELECT orderID FROM FactOrders WHERE YEAR(deliveryDate) = %s ORDER BY orderID LIMIT 5",
+                (year,)
+            )
+            sample_ids = [row['orderID'] for row in cursor.fetchall()]
+            cursor.close()
+            
+            if action == 'end':
+                conn.rollback()
+            
+            return jsonify({
+                "success": True,
+                "action": action,
+                "year": year,
+                "count": count_result['count'],
+                "sample_ids": sample_ids,
+                "isolation_level": isolation_level,
+                "instructions": f"INSERT and COMMIT a new order in year {year} in another session between reads"
+            }), 200
+            
+    except Exception as e:
+        logger.exception(f"Phantom read test failed: {e}")
+        return jsonify({"error": str(e)}), 500
 
 # ========================================================================
 # ERROR HANDLERS
@@ -614,7 +867,7 @@ def internal_error(error):
 # ========================================================================
 
 if __name__ == '__main__':
-    logger.info("Starting Flask API server...")
+    logger.info("Starting Flask API server with concurrency detection...")
     logger.info(f"Central Node: {'Connected' if check_pool_health(central_pool) else 'Disconnected'}")
     logger.info(f"Node 2: {'Connected' if check_pool_health(node2_pool) else 'Disconnected'}")
     logger.info(f"Node 3: {'Connected' if check_pool_health(node3_pool) else 'Disconnected'}")
