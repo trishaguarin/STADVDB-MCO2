@@ -1014,7 +1014,7 @@ def check_and_recover_all():
     # check if node2 needs recovery
     if downtime_tracker['node2'] is not None:
         if check_pool_health(node2_pool):
-            logger.info("Node2 is back online - starting recovery")
+            logger.info("Node2 is back online. Starting recovery...")
             start_time = downtime_tracker['node2']
             end_time = datetime.now()
             
@@ -1031,7 +1031,7 @@ def check_and_recover_all():
     # check if node3 needs recovery
     if downtime_tracker['node3'] is not None:
         if check_pool_health(node3_pool):
-            logger.info("Node3 is back online - starting recovery")
+            logger.info("Node3 is back online. Starting recovery...")
             start_time = downtime_tracker['node3']
             end_time = datetime.now()
             
@@ -1046,6 +1046,13 @@ def check_and_recover_all():
             downtime_tracker['node3'] = None  # clear after recovery
     
     return recovery_results
+
+"""
+TODO:
+    - Recovery API endpoints
+    - Modify CRUD operations to call the replication functions
+    - Startup recovery
+"""
 
 # ========================================================================
 # ERROR HANDLERS
