@@ -17,6 +17,7 @@ CORS(app)
 # DATABASE CONNECTION
 # ========================================================================
 
+# Connection pool configuration
 POOL_SIZE = 5
 POOL_RESET_SESSION = True
 
@@ -197,6 +198,7 @@ def get_delete_concurrency_note(level):
         }
     return None
 
+
 # ========================================================================
 # PARTITIONING LOGIC
 # ========================================================================
@@ -233,10 +235,12 @@ def replicate_insert_to_central(order_id, delivery_date, level):
             return False
             
         cursor = conn.cursor()
+        
         sql = """
         INSERT INTO FactOrders (orderID, userID, deliveryDate, riderID, createdAt, updatedAt, productID, quantity)
         VALUES (%s, 0, %s, 0, NOW(), NOW(), 0, 1)
         """
+        
         cursor.execute(sql, (order_id, delivery_date))
         conn.commit()
         cursor.close()
@@ -288,10 +292,12 @@ def replicate_insert_to_partition(order_id, delivery_date, level):
             return False
             
         cursor = conn.cursor()
+        
         sql = """
         INSERT INTO FactOrders (orderID, userID, deliveryDate, riderID, createdAt, updatedAt, productID, quantity)
         VALUES (%s, 0, %s, 0, NOW(), NOW(), 0, 1)
         """
+        
         cursor.execute(sql, (order_id, delivery_date))
         conn.commit()
         cursor.close()
@@ -327,7 +333,7 @@ def health_check():
 
 @app.route('/api/insert', methods=['POST'])
 def insert_order():
-    """Insert a new order with concurrency detection"""
+    """Insert a new order"""
     conn = None
     try:
         data = request.json
@@ -338,9 +344,8 @@ def insert_order():
         if not order_id or not delivery_date:
             return jsonify({"error": "Missing required fields"}), 400
         
-        # Get isolation warnings
         warnings_info = get_isolation_warnings(isolation_level, "insert")
-        
+
         try:
             conn = central_pool.get_connection()
             
@@ -359,6 +364,7 @@ def insert_order():
             INSERT INTO FactOrders (orderID, userID, deliveryDate, riderID, createdAt, updatedAt, productID, quantity)
             VALUES (%s, 0, %s, 0, NOW(), NOW(), 0, 1)
             """
+            
             cursor.execute(sql, (order_id, delivery_date))
             conn.commit()
             cursor.close()
@@ -400,7 +406,7 @@ def insert_order():
 
 @app.route('/api/read', methods=['POST'])
 def read_order():
-    """Read an order from all nodes with concurrency detection"""
+    """Read an order from all nodes"""
     results = {}
     
     try:
@@ -411,10 +417,11 @@ def read_order():
         if not order_id:
             return jsonify({"error": "Missing order_id"}), 400
         
-        # Get isolation warnings
-        warnings_info = get_isolation_warnings(isolation_level, "read")
+        warnings_info = get_isolation_warnings(isolation_level, "insert")
         
         found = False
+        
+        # Check all nodes
         nodes = [
             ("central", central_pool),
             ("node2", node2_pool),
@@ -430,6 +437,7 @@ def read_order():
                     continue
                             
                 cursor = conn.cursor(dictionary=True)
+                # For central node, only select orderID and deliveryDate
                 if label == "central":
                     cursor.execute(
                         "SELECT orderID, deliveryDate FROM FactOrders WHERE orderID = %s",
@@ -477,9 +485,9 @@ def read_order():
                 "results": results
             }), 404
         
-        # Get concurrency note
         concurrency_note = get_read_concurrency_note(isolation_level)
-        
+
+
         return jsonify({
             "success": True,
             "message": "Order retrieved successfully",
@@ -496,7 +504,8 @@ def read_order():
     except Exception as e:
         logger.exception(f"Read failed: {e}")
         return jsonify({"error": "An unexpected error occurred"}), 500
-
+    
+    
 @app.route('/api/update', methods=['POST'])
 def update_order():
     """Update an order with concurrency detection"""
@@ -713,144 +722,6 @@ def delete_order():
         return jsonify({"error": "An unexpected error occurred"}), 500
 
 # ========================================================================
-# CONCURRENCY TEST ENDPOINTS
-# ========================================================================
-
-@app.route('/api/test/dirty-read', methods=['POST'])
-def test_dirty_read():
-    """Endpoint for testing dirty reads"""
-    try:
-        data = request.json
-        order_id = int(data.get('order_id'))
-        isolation_level = data.get('isolation_level', 'READ UNCOMMITTED')
-        step = data.get('step', 'first')  # 'first' or 'second'
-        
-        if not central_pool:
-            return jsonify({"error": "Central node unavailable"}), 503
-        
-        with get_connection(central_pool) as conn:
-            set_isolation_level(conn, isolation_level)
-            cursor = conn.cursor(dictionary=True)
-            cursor.execute("SELECT deliveryDate, updatedAt FROM FactOrders WHERE orderID = %s", (order_id,))
-            result = cursor.fetchone()
-            cursor.close()
-            
-            if not result:
-                return jsonify({"error": f"Order {order_id} not found"}), 404
-            
-            for key, value in result.items():
-                if hasattr(value, 'isoformat'):
-                    result[key] = value.isoformat()
-            
-            return jsonify({
-                "success": True,
-                "step": step,
-                "order_id": order_id,
-                "data": result,
-                "isolation_level": isolation_level,
-                "instructions": "Update this order in another session WITHOUT committing, then read again"
-            }), 200
-            
-    except Exception as e:
-        logger.exception(f"Dirty read test failed: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/api/test/non-repeatable-read', methods=['POST'])
-def test_non_repeatable_read():
-    """Endpoint for testing non-repeatable reads"""
-    try:
-        data = request.json
-        order_id = int(data.get('order_id'))
-        isolation_level = data.get('isolation_level', 'READ COMMITTED')
-        action = data.get('action', 'start')  # 'start', 'read', or 'end'
-        
-        if not central_pool:
-            return jsonify({"error": "Central node unavailable"}), 503
-        
-        with get_connection(central_pool) as conn:
-            set_isolation_level(conn, isolation_level)
-            
-            if action == 'start':
-                conn.start_transaction()
-            
-            cursor = conn.cursor(dictionary=True)
-            cursor.execute("SELECT deliveryDate, updatedAt FROM FactOrders WHERE orderID = %s", (order_id,))
-            result = cursor.fetchone()
-            cursor.close()
-            
-            if action == 'end':
-                conn.rollback()
-            
-            if not result:
-                return jsonify({"error": f"Order {order_id} not found"}), 404
-            
-            for key, value in result.items():
-                if hasattr(value, 'isoformat'):
-                    result[key] = value.isoformat()
-            
-            return jsonify({
-                "success": True,
-                "action": action,
-                "order_id": order_id,
-                "data": result,
-                "isolation_level": isolation_level,
-                "instructions": "UPDATE and COMMIT this order in another session between reads"
-            }), 200
-            
-    except Exception as e:
-        logger.exception(f"Non-repeatable read test failed: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/api/test/phantom-read', methods=['POST'])
-def test_phantom_read():
-    """Endpoint for testing phantom reads"""
-    try:
-        data = request.json
-        year = int(data.get('year', 2024))
-        isolation_level = data.get('isolation_level', 'REPEATABLE READ')
-        action = data.get('action', 'start')  # 'start', 'read', or 'end'
-        
-        if not central_pool:
-            return jsonify({"error": "Central node unavailable"}), 503
-        
-        with get_connection(central_pool) as conn:
-            set_isolation_level(conn, isolation_level)
-            
-            if action == 'start':
-                conn.start_transaction()
-            
-            cursor = conn.cursor(dictionary=True)
-            cursor.execute(
-                "SELECT COUNT(*) as count FROM FactOrders WHERE YEAR(deliveryDate) = %s",
-                (year,)
-            )
-            count_result = cursor.fetchone()
-            
-            cursor.execute(
-                "SELECT orderID FROM FactOrders WHERE YEAR(deliveryDate) = %s ORDER BY orderID LIMIT 5",
-                (year,)
-            )
-            sample_ids = [row['orderID'] for row in cursor.fetchall()]
-            cursor.close()
-            
-            if action == 'end':
-                conn.rollback()
-            
-            return jsonify({
-                "success": True,
-                "action": action,
-                "year": year,
-                "count": count_result['count'],
-                "sample_ids": sample_ids,
-                "isolation_level": isolation_level,
-                "instructions": f"INSERT and COMMIT a new order in year {year} in another session between reads"
-            }), 200
-            
-    except Exception as e:
-        logger.exception(f"Phantom read test failed: {e}")
-        return jsonify({"error": str(e)}), 500
-
-# ========================================================================
 # ERROR HANDLERS
 # ========================================================================
 
@@ -867,7 +738,7 @@ def internal_error(error):
 # ========================================================================
 
 if __name__ == '__main__':
-    logger.info("Starting Flask API server with concurrency detection...")
+    logger.info("Starting Flask API server...")
     logger.info(f"Central Node: {'Connected' if check_pool_health(central_pool) else 'Disconnected'}")
     logger.info(f"Node 2: {'Connected' if check_pool_health(node2_pool) else 'Disconnected'}")
     logger.info(f"Node 3: {'Connected' if check_pool_health(node3_pool) else 'Disconnected'}")

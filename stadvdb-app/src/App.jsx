@@ -2,12 +2,69 @@ import React, { useState } from 'react';
 import { Database, Plus, Search, Edit, Trash2, Server, CheckCircle, XCircle, Loader } from 'lucide-react';
 import './App.css';
 
+const ConcurrencyWarnings = ({ concurrencyInfo }) => {
+  if (!concurrencyInfo) return null;
+
+  const {
+    isolation_warnings,
+    phantom_warning,
+    dirty_read_warning,
+    non_repeatable_warning,
+    concurrency_note
+  } = concurrencyInfo;
+
+  const warnings = [];
+
+  if (isolation_warnings) {
+    warnings.push({
+      title: `Isolation Level: ${isolation_warnings.isolation_level}`,
+      list: isolation_warnings.warnings
+    });
+  }
+
+  if (dirty_read_warning)
+    warnings.push({ title: dirty_read_warning.type, list: [dirty_read_warning.message] });
+
+  if (non_repeatable_warning)
+    warnings.push({ title: non_repeatable_warning.type, list: [non_repeatable_warning.message] });
+
+  if (phantom_warning)
+    warnings.push({ title: phantom_warning.type, list: [phantom_warning.message] });
+
+  if (concurrency_note)
+    warnings.push({ title: concurrency_note.type, list: [concurrency_note.message] });
+
+  if (warnings.length === 0) return null;
+
+  return (
+    <div className="concurrency-warnings">
+      <h3>⚠️ Concurrency Warnings</h3>
+      {warnings.map((w, i) => (
+        <div key={i} className="warning-card">
+          <h4>{w.title}</h4>
+          <ul>
+            {w.list.map((msg, j) => (
+              <li key={j}>{msg}</li>
+            ))}
+          </ul>
+        </div>
+      ))}
+    </div>
+  );
+};
+
 const formatResponse = (response, operation) => {
   if (!response) return null;
 
   if (operation === 'read' && response.results) {
     return (
       <div className="read-response">
+
+        {/* NEW — show warnings for READ operations */}
+        {response.concurrency_info && (
+          <ConcurrencyWarnings concurrencyInfo={response.concurrency_info} />
+        )}
+
         <div className="node-result">
           <h4>Central Node (All Data)</h4>
           {response.results.central.status === 'found' ? (
@@ -51,10 +108,17 @@ const formatResponse = (response, operation) => {
     );
   }
 
+
   if (response.message) {
     return (
-      <div className="operation-response">
-        <p className="success-message">{response.message}</p>
+    <div className="operation-response">
+
+      {/* NEW: Show concurrency warnings */}
+      {response.concurrency_info && (
+        <ConcurrencyWarnings concurrencyInfo={response.concurrency_info} />
+      )}
+
+      <p className="success-message">{response.message}</p>
         {response.results && (
           <div className="operation-details">
             {Object.entries(response.results).map(([node, result]) => (
