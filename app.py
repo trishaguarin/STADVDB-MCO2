@@ -742,6 +742,310 @@ def delete_order():
     except Exception as e:
         logger.exception(f"Delete failed: {e}")
         return jsonify({"error": "An unexpected error occurred"}), 500
+    
+# ========================================================================
+# GLOBAL FAILURE RECOVERY
+# ========================================================================
+
+downtime_tracker = {
+    'central': None,
+    'node2': None,
+    'node3': None
+}
+
+def log_node_failure(node_name):
+    # log when a node fails during replication
+    downtime_tracker[node_name] = datetime.now()
+    logger.warning(f"Node {node_name} failure detected at {downtime_tracker[node_name]}")
+
+def replicate_to_central(order_data):
+    """
+    Replicate order to central node with failure detection
+    Returns: True if successful, False if failed
+    """
+    
+    try:
+        with get_connection(central_pool) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO FactOrders 
+                (orderID, userID, deliveryDate, riderID, createdAt, updatedAt, productID, quantity)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            """, (
+                order_data['orderID'],
+                order_data['userID'],
+                order_data['deliveryDate'],
+                order_data['riderID'],
+                order_data['createdAt'],
+                order_data['updatedAt'],
+                order_data['productID'],
+                order_data['quantity']
+            ))
+            conn.commit()
+            cursor.close()
+            logger.info(f"Replicated order {order_data['orderID']} to central")
+            return True
+        
+    except Error as e:
+        logger.error(f"Failed to replicate to central: {e}")
+        log_node_failure('central')
+        return False
+    
+def replicate_to_partition(order_data, partition_pool, node_name):
+    """
+    Replicate order to partition node with failure detection
+    Returns: True if successful, False if failed
+    """
+    
+    try:
+        with get_connection(partition_pool) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO FactOrders 
+                (orderID, userID, deliveryDate, riderID, createdAt, updatedAt, productID, quantity)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            """, (
+                order_data['orderID'],
+                order_data['userID'],
+                order_data['deliveryDate'],
+                order_data['riderID'],
+                order_data['createdAt'],
+                order_data['updatedAt'],
+                order_data['productID'],
+                order_data['quantity']
+            ))
+            conn.commit()
+            cursor.close()
+            logger.info(f"Replicated order {order_data['orderID']} to {node_name}")
+            return True
+    except Error as e:
+        logger.error(f"Failed to replicate to {node_name}: {e}")
+        log_node_failure(node_name)
+        return False
+                            
+def recover_missing_to_central(start_time, end_time):
+    """
+    Sync missing transactions from partition nodes to central
+    *Uses LAST-WRITER-WINS
+    """
+    logger.info(f"Starting recovery to central from {start_time} to {end_time}")
+    
+    count_synced = 0
+    count_skipped = 0
+    
+    for node_name, node_pool in [('node2', node2_pool), ('node3', node3_pool)]:
+        try:
+            with get_connection(node_pool) as conn_partition:
+                cursor_partition = conn_partition.cursor()
+                
+                # get orders from partition node during downtime
+                cursor_partition.execute("""
+                    SELECT orderID, userID, deliveryDate, riderID, createdAt, updatedAt, productID, quantity
+                    FROM FactOrders 
+                    WHERE updatedAt BETWEEN %s AND %s
+                """, (start_time, end_time))
+                
+                orders = cursor_partition.fetchall()
+                logger.info(f"Found {len(orders)} orders in {node_name} during downtime")
+                
+                cursor_partition.close()
+                
+                # process each order with last-writer-wins
+                for order in orders:
+                    orderID = order[0]
+                    partition_updated_at = order[5]  # updatedAt timestamp
+                    
+                    try:
+                        with get_connection(central_pool) as conn_central:
+                            cursor_central = conn_central.cursor()
+                            
+                            # if order exists in central, get timestamp
+                            cursor_central.execute("""
+                                SELECT updatedAt FROM FactOrders WHERE orderID = %s
+                            """, (orderID,))
+                            
+                            result = cursor_central.fetchone()
+                            
+                            if result is None:
+                                # if order doesn't exist in central -> INSERT
+                                logger.info(f"Inserting order {orderID} to central")
+                                cursor_central.execute("""
+                                    INSERT INTO FactOrders 
+                                    (orderID, userID, deliveryDate, riderID, createdAt, updatedAt, productID, quantity)
+                                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                                """, order)
+                                conn_central.commit()
+                                count_synced += 1
+                            else:
+                                # order exists -> check which version is newer (last-writer-wins)
+                                central_updated_at = result[0]
+                                
+                                if partition_updated_at > central_updated_at:
+                                    # if partition version is newer -> update central
+                                    logger.info(f"Updating order {orderID} in central (partition version is newer)")
+                                    cursor_central.execute("""
+                                        UPDATE FactOrders 
+                                        SET userID=%s, deliveryDate=%s, riderID=%s, 
+                                            createdAt=%s, updatedAt=%s, productID=%s, quantity=%s
+                                        WHERE orderID=%s
+                                    """, (order[1], order[2], order[3], order[4], order[5], order[6], order[7], orderID))
+                                    conn_central.commit()
+                                    count_synced += 1
+                                else:
+                                    # if central version is newer or equal -> skip
+                                    logger.info(f"Skipping order {orderID} (central version is newer or equal)")
+                                    count_skipped += 1
+                            
+                            cursor_central.close()
+                    except Error as e:
+                        logger.error(f"Failed to sync order {orderID} to central: {e}")
+        
+        except Error as e:
+            logger.error(f"Failed to recover from {node_name}: {e}")
+    
+    logger.info(f"Recovery to central complete: {count_synced} synced, {count_skipped} skipped")
+    return {'synced': count_synced, 'skipped': count_skipped}
+
+def recover_missing_to_partition(start_time, end_time, year, partition_pool, node_name):
+    """
+    Sync missing transactions from central to partition node
+    *Uses LAST-WRITER-WINS
+    Only syncs orders for the specific year partition
+    """
+    logger.info(f"Starting recovery to {node_name} for year {year} from {start_time} to {end_time}")
+    
+    count_synced = 0
+    count_skipped = 0
+    
+    try:
+        with get_connection(central_pool) as conn_central:
+            cursor_central = conn_central.cursor()
+            
+            cursor_central.execute("""
+                SELECT orderID, userID, deliveryDate, riderID, createdAt, updatedAt, productID, quantity
+                FROM FactOrders 
+                WHERE updatedAt BETWEEN %s AND %s 
+                AND YEAR(deliveryDate) = %s
+            """, (start_time, end_time, year))
+            
+            orders = cursor_central.fetchall()
+            logger.info(f"Found {len(orders)} orders for year {year} in central during downtime")
+            
+            cursor_central.close()
+            
+            # process each order with last-writer-wins
+            for order in orders:
+                orderID = order[0]
+                central_updated_at = order[5]  # updatedAt timestamp
+                
+                try:
+                    with get_connection(partition_pool) as conn_partition:
+                        cursor_partition = conn_partition.cursor()
+                        
+                        # if order exists in partition, get timestamp
+                        cursor_partition.execute("""
+                            SELECT updatedAt FROM FactOrders WHERE orderID = %s
+                        """, (orderID,))
+                        
+                        result = cursor_partition.fetchone()
+                        
+                        if result is None:
+                            # if order doesn't exist in partition -> INSERT
+                            logger.info(f"Inserting order {orderID} to {node_name}")
+                            cursor_partition.execute("""
+                                INSERT INTO FactOrders 
+                                (orderID, userID, deliveryDate, riderID, createdAt, updatedAt, productID, quantity)
+                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                            """, order)
+                            conn_partition.commit()
+                            count_synced += 1
+                        else:
+                            # order exists -> check which version is newer (last-writer-wins)
+                            partition_updated_at = result[0]
+                            
+                            if central_updated_at > partition_updated_at:
+                                # if central version is newer -> update partition
+                                logger.info(f"Updating order {orderID} in {node_name} (central version is newer)")
+                                cursor_partition.execute("""
+                                    UPDATE FactOrders 
+                                    SET userID=%s, deliveryDate=%s, riderID=%s, 
+                                        createdAt=%s, updatedAt=%s, productID=%s, quantity=%s
+                                    WHERE orderID=%s
+                                """, (order[1], order[2], order[3], order[4], order[5], order[6], order[7], orderID))
+                                conn_partition.commit()
+                                count_synced += 1
+                            else:
+                                # if partition version is newer or equal -> skip
+                                logger.info(f"Skipping order {orderID} ({node_name} version is newer or equal)")
+                                count_skipped += 1
+                        
+                        cursor_partition.close()
+                except Error as e:
+                    logger.error(f"Failed to sync order {orderID} to {node_name}: {e}")
+    
+    except Error as e:
+        logger.error(f"Failed to recover to {node_name}: {e}")
+    
+    logger.info(f"Recovery to {node_name} complete: {count_synced} synced, {count_skipped} skipped")
+    return {'synced': count_synced, 'skipped': count_skipped}
+
+def check_and_recover_all():
+    """
+    Check all nodes and recover if needed
+    """
+    logger.info("Checking for nodes that need recovery...")
+    
+    recovery_results = {}
+    
+    # check if central needs recovery
+    if downtime_tracker['central'] is not None:
+        if check_pool_health(central_pool):
+            logger.info("Central is back online. Starting recovery...")
+            start_time = downtime_tracker['central']
+            end_time = datetime.now()
+            
+            result = recover_missing_to_central(
+                start_time.strftime('%Y-%m-%d %H:%M:%S'),
+                end_time.strftime('%Y-%m-%d %H:%M:%S')
+            )
+            recovery_results['central'] = result
+            downtime_tracker['central'] = None  # clear after recovery
+    
+    # check if node2 needs recovery
+    if downtime_tracker['node2'] is not None:
+        if check_pool_health(node2_pool):
+            logger.info("Node2 is back online - starting recovery")
+            start_time = downtime_tracker['node2']
+            end_time = datetime.now()
+            
+            result = recover_missing_to_partition(
+                start_time.strftime('%Y-%m-%d %H:%M:%S'),
+                end_time.strftime('%Y-%m-%d %H:%M:%S'),
+                2024,
+                node2_pool,
+                'node2'
+            )
+            recovery_results['node2'] = result
+            downtime_tracker['node2'] = None  # clear after recovery 
+            
+    # check if node3 needs recovery
+    if downtime_tracker['node3'] is not None:
+        if check_pool_health(node3_pool):
+            logger.info("Node3 is back online - starting recovery")
+            start_time = downtime_tracker['node3']
+            end_time = datetime.now()
+            
+            result = recover_missing_to_partition(
+                start_time.strftime('%Y-%m-%d %H:%M:%S'),
+                end_time.strftime('%Y-%m-%d %H:%M:%S'),
+                2025,
+                node3_pool,
+                'node3'
+            )
+            recovery_results['node3'] = result
+            downtime_tracker['node3'] = None  # clear after recovery
+    
+    return recovery_results
 
 # ========================================================================
 # ERROR HANDLERS
