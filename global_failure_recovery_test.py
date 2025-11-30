@@ -248,7 +248,7 @@ def test_case2():
     check_order_location(orderID)
     
 if __name__ == "__main__":
-    cleanup_test_orders()
+    #cleanup_test_orders()
 
     while True:
         print("===========================================")
