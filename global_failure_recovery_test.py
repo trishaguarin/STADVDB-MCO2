@@ -91,7 +91,7 @@ def cleanup_test_orders():
     
 def check_order_location(orderID):
     """Check which nodes contain an order""" 
-    print(f"\nChecking location of order {orderID}:")
+    print(f"Checking location of order {orderID}...")
     
     nodes = [
         ("10.2.14.120", "stadvdb_node1", "Central"),
@@ -127,11 +127,11 @@ def copy_missing_to_central(start_time, end_time):
     conn_central = connect_node("10.2.14.120", "stadvdb", "Password123!", "stadvdb_node1")
     
     if not conn_node2:
-        print("✗ Error: Cannot connect to Node 2")
+        print("Error: Cannot connect to Node 2")
         return
     
     if not conn_central:
-        print("✗ Error: Cannot connect to Central")
+        print("Error: Cannot connect to Central")
         conn_node2.close()
         return
     
@@ -156,7 +156,7 @@ def copy_missing_to_central(start_time, end_time):
         
         if count == 0:
             # insert missing order
-            print(f"  → Inserting order {orderID}...")
+            print(f"  -> Inserting order {orderID}...")
             cursor_central.execute("""
                 INSERT INTO FactOrders 
                 (orderID, userID, deliveryDate, riderID, createdAt, updatedAt, productID, quantity)
@@ -165,7 +165,7 @@ def copy_missing_to_central(start_time, end_time):
             count_synced += 1
         else:
             # order exists but might be outdated -> update it
-            print(f"  → Updating order {orderID}...")
+            print(f"  -> Updating order {orderID}...")
             cursor_central.execute("""
                 UPDATE FactOrders 
                 SET userID=%s, deliveryDate=%s, riderID=%s, updatedAt=%s, productID=%s, quantity=%s
