@@ -6,6 +6,7 @@ import logging
 from datetime import datetime
 from contextlib import contextmanager
 import time
+from datetime import timedelta
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -381,6 +382,8 @@ def replicate_insert_to_central(order_id, delivery_date, level, use_locking=True
 def replicate_insert_to_partition(order_id, delivery_date, level, use_locking=True):
     """Replicate insert from central node to partition node with optional locking"""
     conn = None
+    node_name = None
+    
     try:
         if not delivery_date:
             logger.error("No delivery date provided for partition determination")
@@ -395,14 +398,19 @@ def replicate_insert_to_partition(order_id, delivery_date, level, use_locking=Tr
         pool = None
         if year == 2024:
             pool = node2_pool
+            node_name = 'node2'
         elif year == 2025:
             pool = node3_pool
+            node_name = 'node3'
         else:
             logger.warning(f"No partition node for date {delivery_date}")
             return True
             
         if not pool:
             logger.error("No valid pool found for replication")
+            
+            if node_name:
+                log_node_failure(node_name)
             return False
             
         conn = pool.get_connection()
@@ -436,6 +444,10 @@ def replicate_insert_to_partition(order_id, delivery_date, level, use_locking=Tr
         return True
     except Exception as e:
         logger.error(f"Failed to replicate to partition node: {e}")
+        
+        if node_name:
+            log_node_failure(node_name)
+            
         try:
             if conn and conn.is_connected():
                 conn.rollback()
@@ -1283,12 +1295,125 @@ def check_and_recover_all():
     
     return recovery_results
 
+# ========================================================================
+# RECOVERY ENDPOINTS
+# ========================================================================
+
+@app.route('/api/recovery/status', methods=['GET'])
+def get_recovery_status():
+    # Get current recovery status and downtime tracking
+    return jsonify({
+        "downtime_tracker": {
+            node: dt.strftime('%Y-%m-%d %H:%M:%S') if dt else None
+            for node, dt in downtime_tracker.items()
+        },
+        "node_health": {
+            "central": check_pool_health(central_pool),
+            "node2": check_pool_health(node2_pool),
+            "node3": check_pool_health(node3_pool)
+        }
+    }), 200
+
+@app.route('/api/recovery/trigger', methods=['POST'])
+def trigger_recovery():
+    # Manually trigger recovery for all nodes
+    try:
+        results = check_and_recover_all()
+        return jsonify({
+            "success": True,
+            "message": "Recovery completed",
+            "results": results
+        }), 200
+    except Exception as e:
+        logger.exception(f"Recovery failed: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/recovery/clear', methods=['POST'])
+def clear_downtime_tracker():
+    # Clear downtime tracker (admin function)
+    global downtime_tracker
+    downtime_tracker = {'central': None, 'node2': None, 'node3': None}
+    return jsonify({"success": True, "message": "Downtime tracker cleared"}), 200
+
 """
 TODO:
     - Recovery API endpoints
     - Modify CRUD operations to call the replication functions
     - Startup recovery
 """
+# ========================================================================
+# DEBUGGING STUFF (temp)
+# ========================================================================
+
+@app.route('/api/debug/recent-orders', methods=['GET'])
+def debug_recent_orders():
+    """Debug endpoint to see recent orders"""
+    try:
+        with get_connection(central_pool) as conn:
+            cursor = conn.cursor()
+            
+            # Get orders from last 24 hours
+            cursor.execute("""
+                SELECT orderID, deliveryDate, updatedAt, 
+                       TIMESTAMPDIFF(HOUR, updatedAt, NOW()) as hours_ago
+                FROM FactOrders 
+                WHERE orderID >= 6000000
+                ORDER BY updatedAt DESC 
+                LIMIT 20
+            """)
+            
+            orders = []
+            for row in cursor.fetchall():
+                orders.append({
+                    'orderID': row[0],
+                    'deliveryDate': str(row[1]),
+                    'updatedAt': str(row[2]),
+                    'hours_ago': row[3]
+                })
+            
+            cursor.close()
+            
+            return jsonify({
+                'orders': orders,
+                'current_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    
+@app.route('/api/debug/order-times/<int:order_id>', methods=['GET'])
+def debug_order_times(order_id):
+    """Check order timestamps in all nodes"""
+    results = {}
+    
+    for name, pool in [('central', central_pool), ('node2', node2_pool), ('node3', node3_pool)]:
+        try:
+            with get_connection(pool) as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT orderID, createdAt, updatedAt,
+                           NOW() as server_time,
+                           TIMESTAMPDIFF(MINUTE, updatedAt, NOW()) as minutes_ago
+                    FROM FactOrders 
+                    WHERE orderID = %s
+                """, (order_id,))
+                
+                row = cursor.fetchone()
+                cursor.close()
+                
+                if row:
+                    results[name] = {
+                        'exists': True,
+                        'createdAt': str(row[1]),
+                        'updatedAt': str(row[2]),
+                        'server_time_now': str(row[3]),
+                        'minutes_ago': row[4]
+                    }
+                else:
+                    results[name] = {'exists': False}
+        except Exception as e:
+            results[name] = {'error': str(e)}
+    
+    return jsonify(results)
 
 # ========================================================================
 # ERROR HANDLERS
@@ -1302,6 +1427,66 @@ def not_found(error):
 def internal_error(error):
     return jsonify({"error": "Internal server error"}), 500
 
+def startup_recovery_check():
+    """
+    Run recovery check on startup using database time
+    """
+    logger.info("Running startup recovery check...")
+    
+    # Get current time from database
+    try:
+        with get_connection(central_pool) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT NOW()")
+            db_now = cursor.fetchone()[0]
+            cursor.close()
+    except Exception as e:
+        logger.error(f"Failed to get database time: {e}")
+        db_now = datetime.now()
+    
+    # Calculate window based on database time
+    end_time = db_now
+    start_time = end_time - timedelta(hours=24)
+    
+    start_str = start_time.strftime('%Y-%m-%d %H:%M:%S')
+    end_str = end_time.strftime('%Y-%m-%d %H:%M:%S')
+    
+    logger.info(f"Using database time window: {start_str} to {end_str}")
+    
+    results = {}
+    
+    # Try to recover central if healthy
+    if check_pool_health(central_pool):
+        logger.info("Central is online - checking for missing data...")
+        try:
+            result = recover_missing_to_central(start_str, end_str)
+            if result['synced'] > 0:
+                results['central'] = result
+        except Exception as e:
+            logger.error(f"Failed to recover central: {e}")
+    
+    # Try to recover node2 if healthy
+    if check_pool_health(node2_pool):
+        logger.info("Node2 is online - checking for missing data...")
+        try:
+            result = recover_missing_to_partition(start_str, end_str, 2024, node2_pool, 'node2')
+            if result['synced'] > 0:
+                results['node2'] = result
+        except Exception as e:
+            logger.error(f"Failed to recover node2: {e}")
+    
+    # Try to recover node3 if healthy
+    if check_pool_health(node3_pool):
+        logger.info("Node3 is online - checking for missing data...")
+        try:
+            result = recover_missing_to_partition(start_str, end_str, 2025, node3_pool, 'node3')
+            if result['synced'] > 0:
+                results['node3'] = result
+        except Exception as e:
+            logger.error(f"Failed to recover node3: {e}")
+    
+    return results
+
 # ========================================================================
 # MAIN
 # ========================================================================
@@ -1311,5 +1496,15 @@ if __name__ == '__main__':
     logger.info(f"Central Node: {'Connected' if check_pool_health(central_pool) else 'Disconnected'}")
     logger.info(f"Node 2: {'Connected' if check_pool_health(node2_pool) else 'Disconnected'}")
     logger.info(f"Node 3: {'Connected' if check_pool_health(node3_pool) else 'Disconnected'}")
+    
+    logger.info("Checking for pending recoveries...")
+    try:
+        results = startup_recovery_check()
+        if results:
+            logger.info(f"Startup recovery COMPLETED: {results}")
+        else:
+            logger.info("No data needed recovery")
+    except Exception as e:
+        logger.error(f"Startup recovery check FAILED: {e}")
     
     app.run(host='0.0.0.0', port=5000, debug=True)
