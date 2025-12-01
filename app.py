@@ -961,6 +961,161 @@ def delete_order():
         return jsonify({"error": str(e)}), 500
 
 # ========================================================================
+# GLOBAL FAILURE RECOVERY TEST ENDPOINTS
+# ========================================================================
+
+@app.route('/api/recovery/test/case1', methods=['POST'])
+def test_case1():
+    """Case 1: Replication Failure - Node 2 to Central"""
+    try:
+        logger.info("TEST CASE 1: Replication Failure - Node 2 to Central")
+        log_node_failure('node2')
+        start_time = (datetime.now() - timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M:%S')
+        end_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        result = recover_missing_to_central(start_time, end_time)
+        return jsonify({
+            "success": True,
+            "case": "Case 1: Replication Failure - Node 2 to Central",
+            "result": result,
+            "message": "Recovery completed successfully"
+        }), 200
+    except Exception as e:
+        logger.exception(f"Test Case 1 failed: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/recovery/test/case2', methods=['POST'])
+def test_case2():
+    """Case 2: Central Node Recovery"""
+    try:
+        logger.info("TEST CASE 2: Central Node Recovery")
+        log_node_failure('central')
+        start_time = (datetime.now() - timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M:%S')
+        end_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        result_node2 = recover_missing_to_partition(start_time, end_time, 2024, node2_pool, 'node2')
+        result_node3 = recover_missing_to_partition(start_time, end_time, 2025, node3_pool, 'node3')
+        downtime_tracker['central'] = None
+        return jsonify({
+            "success": True,
+            "case": "Case 2: Central Node Recovery",
+            "result": {
+                "node2": result_node2,
+                "node3": result_node3
+            },
+            "message": "Central recovery completed successfully"
+        }), 200
+    except Exception as e:
+        logger.exception(f"Test Case 2 failed: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/recovery/test/case3', methods=['POST'])
+def test_case3():
+    """Case 3: Replication Failure - Central to Node 2"""
+    try:
+        logger.info("TEST CASE 3: Replication Failure - Central to Node 2")
+        log_node_failure('node2')
+        start_time = (datetime.now() - timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M:%S')
+        end_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        result = recover_missing_to_partition(start_time, end_time, 2024, node2_pool, 'node2')
+        downtime_tracker['node2'] = None
+        return jsonify({
+            "success": True,
+            "case": "Case 3: Replication Failure - Central to Node 2",
+            "result": result,
+            "message": "Node 2 recovery completed successfully"
+        }), 200
+    except Exception as e:
+        logger.exception(f"Test Case 3 failed: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/recovery/test/case4', methods=['POST'])
+def test_case4():
+    """Case 4: Node 2 Recovery"""
+    try:
+        logger.info("TEST CASE 4: Node 2 Recovery")
+        log_node_failure('node2')
+        start_time = (datetime.now() - timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M:%S')
+        end_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        result = recover_missing_to_central(start_time, end_time)
+        downtime_tracker['node2'] = None
+        return jsonify({
+            "success": True,
+            "case": "Case 4: Node 2 Recovery",
+            "result": result,
+            "message": "Node 2 recovery completed successfully"
+        }), 200
+    except Exception as e:
+        logger.exception(f"Test Case 4 failed: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/recovery/test/all', methods=['POST'])
+def test_all_cases():
+    """Run all test cases sequentially"""
+    try:
+        logger.info("RUNNING ALL TEST CASES")
+        results = {}
+        
+        # Case 1
+        logger.info("Running Case 1...")
+        log_node_failure('node2')
+        start_time = (datetime.now() - timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M:%S')
+        end_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        results['case1'] = recover_missing_to_central(start_time, end_time)
+        downtime_tracker['node2'] = None
+        
+        # Case 2
+        logger.info("Running Case 2...")
+        log_node_failure('central')
+        start_time = (datetime.now() - timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M:%S')
+        end_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        results['case2_node2'] = recover_missing_to_partition(start_time, end_time, 2024, node2_pool, 'node2')
+        results['case2_node3'] = recover_missing_to_partition(start_time, end_time, 2025, node3_pool, 'node3')
+        downtime_tracker['central'] = None
+        
+        # Case 3
+        logger.info("Running Case 3...")
+        log_node_failure('node2')
+        start_time = (datetime.now() - timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M:%S')
+        end_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        results['case3'] = recover_missing_to_partition(start_time, end_time, 2024, node2_pool, 'node2')
+        downtime_tracker['node2'] = None
+        
+        # Case 4
+        logger.info("Running Case 4...")
+        log_node_failure('node2')
+        start_time = (datetime.now() - timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M:%S')
+        end_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        results['case4'] = recover_missing_to_central(start_time, end_time)
+        downtime_tracker['node2'] = None
+        
+        return jsonify({
+            "success": True,
+            "message": "All test cases completed successfully",
+            "results": results
+        }), 200
+    except Exception as e:
+        logger.exception(f"Test all cases failed: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/recovery/test/cleanup', methods=['POST'])
+def cleanup_test_data():
+    """Cleanup test data and reset downtime tracker"""
+    try:
+        logger.info("Cleaning up test data")
+        global downtime_tracker
+        downtime_tracker = {'central': None, 'node2': None, 'node3': None}
+        return jsonify({
+            "success": True,
+            "message": "Test data cleaned up successfully",
+            "downtime_tracker": {
+                node: dt.strftime('%Y-%m-%d %H:%M:%S') if dt else None
+                for node, dt in downtime_tracker.items()
+            }
+        }), 200
+    except Exception as e:
+        logger.exception(f"Cleanup failed: {e}")
+        return jsonify({"error": str(e)}), 500
+
+# ========================================================================
 # ERROR HANDLERS
 # ========================================================================
 

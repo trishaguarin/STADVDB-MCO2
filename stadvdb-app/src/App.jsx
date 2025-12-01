@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
-import { Database, Plus, Search, Edit, Trash2, Server, CheckCircle, XCircle, Loader, Lock, Unlock } from 'lucide-react';
+import { Database, Plus, Search, Edit, Trash2, Server, CheckCircle, XCircle, Loader, Lock, Unlock, AlertCircle } from 'lucide-react';
 import './App.css';
+import GlobalRecoveryTest from './GlobalRecoveryTest';
 
 const ConcurrencyWarnings = ({ concurrencyInfo }) => {
   if (!concurrencyInfo) return null;
@@ -165,6 +166,7 @@ const App = () => {
   const [loading, setLoading] = useState(false);
   const [response, setResponse] = useState(null);
   const [error, setError] = useState('');
+  const [currentView, setCurrentView] = useState('main');
 
   const isolationLevels = {
     '1': 'READ UNCOMMITTED',
@@ -228,6 +230,19 @@ const App = () => {
     resetForm();
   };
 
+  if (currentView === 'recovery') {
+    return (
+      <div className="app">
+        <div className="view-header">
+          <button onClick={() => setCurrentView('main')} className="back-button">
+            ← Back to Main
+          </button>
+        </div>
+        <GlobalRecoveryTest />
+      </div>
+    );
+  }
+
   return (
     <div className="app">
       <div className="container">
@@ -241,6 +256,14 @@ const App = () => {
               <p className="header-subtitle">STADVDB MCO2 - Multi-Node Transaction Manager with Locking</p>
             </div>
           </div>
+          <button 
+            onClick={() => setCurrentView('recovery')} 
+            className="recovery-menu-button"
+            title="Open Global Recovery Test Menu"
+          >
+            <AlertCircle size={20} />
+            <span>Recovery Tests</span>
+          </button>
         </header>
 
         {/* Node Status */}
