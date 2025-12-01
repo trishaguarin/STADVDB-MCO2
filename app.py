@@ -317,7 +317,7 @@ def determine_partition_node(delivery_date):
             year = delivery_date.year
         
         if year == 2024:
-            return node2_pool
+            return None
         elif year == 2025:
             return node3_pool
         else:
@@ -325,6 +325,157 @@ def determine_partition_node(delivery_date):
     except Exception as e:
         logger.error(f"Invalid date format: {delivery_date} - {e}")
         return None
+    
+# ========================================================================
+# GLOBAL FAILURE RECOVERY
+# ========================================================================
+
+downtime_tracker = {'central': None, 'node2': None, 'node3': None}
+
+def log_node_failure(node_name):
+    downtime_tracker[node_name] = datetime.now()
+    logger.warning(f"Node {node_name} failure detected at {downtime_tracker[node_name]}")
+
+def recover_missing_to_central(start_time, end_time):
+    logger.info(f"Starting recovery to central from {start_time} to {end_time}")
+    count_synced = count_skipped = 0
+    for node_name, node_pool in [('node2', node2_pool), ('node3', node3_pool)]:
+        try:
+            with get_connection(node_pool) as conn_partition:
+                cursor_partition = conn_partition.cursor()
+                cursor_partition.execute("SELECT orderID, userID, deliveryDate, riderID, createdAt, updatedAt, productID, quantity FROM FactOrders WHERE updatedAt BETWEEN %s AND %s", (start_time, end_time))
+                orders = cursor_partition.fetchall()
+                logger.info(f"Found {len(orders)} orders in {node_name} during downtime")
+                cursor_partition.close()
+                for order in orders:
+                    orderID, partition_updated_at = order[0], order[5]
+                    try:
+                        with get_connection(central_pool) as conn_central:
+                            cursor_central = conn_central.cursor()
+                            cursor_central.execute("SELECT updatedAt FROM FactOrders WHERE orderID = %s", (orderID,))
+                            result = cursor_central.fetchone()
+                            if result is None:
+                                logger.info(f"Inserting order {orderID} to central")
+                                cursor_central.execute("INSERT INTO FactOrders (orderID, userID, deliveryDate, riderID, createdAt, updatedAt, productID, quantity) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)", order)
+                                conn_central.commit()
+                                count_synced += 1
+                            else:
+                                if partition_updated_at > result[0]:
+                                    logger.info(f"Updating order {orderID} in central (partition version is newer)")
+                                    cursor_central.execute("UPDATE FactOrders SET userID=%s, deliveryDate=%s, riderID=%s, createdAt=%s, updatedAt=%s, productID=%s, quantity=%s WHERE orderID=%s", (order[1], order[2], order[3], order[4], order[5], order[6], order[7], orderID))
+                                    conn_central.commit()
+                                    count_synced += 1
+                                else:
+                                    logger.info(f"Skipping order {orderID} (central version is newer or equal)")
+                                    count_skipped += 1
+                            cursor_central.close()
+                    except Error as e:
+                        logger.error(f"Failed to sync order {orderID}: {e}")
+        except Error as e:
+            logger.error(f"Failed to recover from {node_name}: {e}")
+    logger.info(f"Recovery to central complete: {count_synced} synced, {count_skipped} skipped")
+    return {'synced': count_synced, 'skipped': count_skipped}
+
+def recover_missing_to_partition(start_time, end_time, year, partition_pool, node_name):
+    logger.info(f"Starting recovery to {node_name} for year {year} from {start_time} to {end_time}")
+    count_synced = count_skipped = 0
+    try:
+        with get_connection(central_pool) as conn_central:
+            cursor_central = conn_central.cursor()
+            cursor_central.execute("SELECT orderID, userID, deliveryDate, riderID, createdAt, updatedAt, productID, quantity FROM FactOrders WHERE updatedAt BETWEEN %s AND %s AND YEAR(deliveryDate) = %s", (start_time, end_time, year))
+            orders = cursor_central.fetchall()
+            logger.info(f"Found {len(orders)} orders for year {year} in central during downtime")
+            cursor_central.close()
+            for order in orders:
+                orderID, central_updated_at = order[0], order[5]
+                try:
+                    with get_connection(partition_pool) as conn_partition:
+                        cursor_partition = conn_partition.cursor()
+                        cursor_partition.execute("SELECT updatedAt FROM FactOrders WHERE orderID = %s", (orderID,))
+                        result = cursor_partition.fetchone()
+                        if result is None:
+                            logger.info(f"Inserting order {orderID} to {node_name}")
+                            cursor_partition.execute("INSERT INTO FactOrders (orderID, userID, deliveryDate, riderID, createdAt, updatedAt, productID, quantity) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)", order)
+                            conn_partition.commit()
+                            count_synced += 1
+                        else:
+                            if central_updated_at > result[0]:
+                                logger.info(f"Updating order {orderID} in {node_name} (central version is newer)")
+                                cursor_partition.execute("UPDATE FactOrders SET userID=%s, deliveryDate=%s, riderID=%s, createdAt=%s, updatedAt=%s, productID=%s, quantity=%s WHERE orderID=%s", (order[1], order[2], order[3], order[4], order[5], order[6], order[7], orderID))
+                                conn_partition.commit()
+                                count_synced += 1
+                            else:
+                                logger.info(f"Skipping order {orderID} ({node_name} version is newer or equal)")
+                                count_skipped += 1
+                        cursor_partition.close()
+                except Error as e:
+                    logger.error(f"Failed to sync order {orderID}: {e}")
+    except Error as e:
+        logger.error(f"Failed to recover to {node_name}: {e}")
+    logger.info(f"Recovery to {node_name} complete: {count_synced} synced, {count_skipped} skipped")
+    return {'synced': count_synced, 'skipped': count_skipped}
+
+def check_and_recover_all():
+    logger.info("Checking for nodes that need recovery...")
+    recovery_results = {}
+    if downtime_tracker['central'] and check_pool_health(central_pool):
+        logger.info("Central is back online. Starting recovery...")
+        result = recover_missing_to_central(downtime_tracker['central'].strftime('%Y-%m-%d %H:%M:%S'), datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+        recovery_results['central'] = result
+        downtime_tracker['central'] = None
+    if downtime_tracker['node2'] and check_pool_health(node2_pool):
+        logger.info("Node2 is back online. Starting recovery...")
+        result = recover_missing_to_partition(downtime_tracker['node2'].strftime('%Y-%m-%d %H:%M:%S'), datetime.now().strftime('%Y-%m-%d %H:%M:%S'), 2024, node2_pool, 'node2')
+        recovery_results['node2'] = result
+        downtime_tracker['node2'] = None
+    if downtime_tracker['node3'] and check_pool_health(node3_pool):
+        logger.info("Node3 is back online. Starting recovery...")
+        result = recover_missing_to_partition(downtime_tracker['node3'].strftime('%Y-%m-%d %H:%M:%S'), datetime.now().strftime('%Y-%m-%d %H:%M:%S'), 2025, node3_pool, 'node3')
+        recovery_results['node3'] = result
+        downtime_tracker['node3'] = None
+    return recovery_results
+
+def startup_recovery_check():
+    logger.info("Running startup recovery check...")
+    try:
+        with get_connection(central_pool) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT NOW() - INTERVAL 24 HOUR, NOW()")
+            row = cursor.fetchone()
+            cursor.close()
+            start_time, end_time = row[0], row[1]
+    except Exception as e:
+        logger.error(f"Failed to get database time: {e}")
+        end_time = datetime.now()
+        start_time = end_time - timedelta(hours=24)
+    start_str, end_str = start_time.strftime('%Y-%m-%d %H:%M:%S'), end_time.strftime('%Y-%m-%d %H:%M:%S')
+    logger.info(f"Using database time window: {start_str} to {end_str}")
+    results = {}
+    if check_pool_health(central_pool):
+        logger.info("Central is online - checking for missing data...")
+        try:
+            result = recover_missing_to_central(start_str, end_str)
+            if result['synced'] > 0:
+                results['central'] = result
+        except Exception as e:
+            logger.error(f"Failed to recover central: {e}")
+    if check_pool_health(node2_pool):
+        logger.info("Node2 is online - checking for missing data...")
+        try:
+            result = recover_missing_to_partition(start_str, end_str, 2024, node2_pool, 'node2')
+            if result['synced'] > 0:
+                results['node2'] = result
+        except Exception as e:
+            logger.error(f"Failed to recover node2: {e}")
+    if check_pool_health(node3_pool):
+        logger.info("Node3 is online - checking for missing data...")
+        try:
+            result = recover_missing_to_partition(start_str, end_str, 2025, node3_pool, 'node3')
+            if result['synced'] > 0:
+                results['node3'] = result
+        except Exception as e:
+            logger.error(f"Failed to recover node3: {e}")
+    return results
 
 # ========================================================================
 # API ENDPOINTS WITH 2PL
@@ -383,13 +534,34 @@ def insert_order():
         # 3. Determine partition and acquire connection
         partition_pool = determine_partition_node(delivery_date)
         partition_conn = None
+        partition_success = True  # Track if partition replication succeeded
+
         if partition_pool:
-            partition_conn = lock_mgr.acquire_connection(partition_pool)
-            lock_mgr.set_isolation_level(partition_conn, isolation_level)
-            
-            # 4. Acquire lock on partition node
-            if use_locking:
-                lock_mgr.acquire_row_lock(partition_conn, order_id, 'FOR UPDATE')
+            try:
+                partition_conn = lock_mgr.acquire_connection(partition_pool)
+                lock_mgr.set_isolation_level(partition_conn, isolation_level)
+                
+                # 4. Acquire lock on partition node
+                if use_locking:
+                    lock_mgr.acquire_row_lock(partition_conn, order_id, 'FOR UPDATE')
+            except Exception as e:
+                logger.error(f"Failed to connect to partition node: {e}")
+                partition_success = False
+                partition_conn = None
+                
+                # Log node failure for recovery
+                year = int(delivery_date[:4])
+                if year == 2024:
+                    log_node_failure('node2')
+                elif year == 2025:
+                    log_node_failure('node3')
+        else:
+            partition_success = False
+            year = int(delivery_date[:4])
+            if year == 2024:
+                log_node_failure('node2')
+            elif year == 2025:
+                log_node_failure('node3')
         
         # All locks acquired - perform operations
         logger.info(f"[2PL] All locks acquired for order {order_id}")
@@ -425,18 +597,19 @@ def insert_order():
         duration_ms = (end_time - start_time).total_seconds() * 1000
         
         response = {
-            "success": True,
-            "message": "Order inserted successfully",
-            "order_id": order_id,
-            "locking_protocol": "2PL (Two-Phase Locking)",
-            "locking_used": use_locking,
-            "lock_summary": lock_mgr.get_lock_summary(),
-            "transaction_time_ms": duration_ms,
-            "concurrency_info": {
-                "isolation_warnings": warnings_info,
-                "phantom_warning": phantom_warning
-            }
+        "success": True,
+        "message": "Order inserted successfully",
+        "order_id": order_id,
+        "locking_protocol": "2PL (Two-Phase Locking)",
+        "locking_used": use_locking,
+        "replication_status": "success" if partition_success else "partial",  # ADD THIS
+        "lock_summary": lock_mgr.get_lock_summary(),
+        "transaction_time_ms": duration_ms,
+        "concurrency_info": {
+            "isolation_warnings": warnings_info,
+            "phantom_warning": phantom_warning
         }
+    }
         
         return jsonify(response), 201
         
@@ -799,65 +972,45 @@ def not_found(error):
 def internal_error(error):
     return jsonify({"error": "Internal server error"}), 500
 
-def startup_recovery_check():
-    """
-    Run recovery check on startup using database time
-    """
-    logger.info("Running startup recovery check...")
-    
-    # Get current time from database
+# ========================================================================
+# RECOVERY ENDPOINTS
+# ========================================================================
+
+@app.route('/api/recovery/status', methods=['GET'])
+def get_recovery_status():
+    """Get current recovery status and downtime tracking"""
+    return jsonify({
+        "downtime_tracker": {
+            node: dt.strftime('%Y-%m-%d %H:%M:%S') if dt else None
+            for node, dt in downtime_tracker.items()
+        },
+        "node_health": {
+            "central": check_pool_health(central_pool),
+            "node2": check_pool_health(node2_pool),
+            "node3": check_pool_health(node3_pool)
+        }
+    }), 200
+
+@app.route('/api/recovery/trigger', methods=['POST'])
+def trigger_recovery():
+    """Manually trigger recovery for all nodes"""
     try:
-        with get_connection(central_pool) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT NOW()")
-            db_now = cursor.fetchone()[0]
-            cursor.close()
+        results = check_and_recover_all()
+        return jsonify({
+            "success": True,
+            "message": "Recovery completed",
+            "results": results
+        }), 200
     except Exception as e:
-        logger.error(f"Failed to get database time: {e}")
-        db_now = datetime.now()
-    
-    # Calculate window based on database time
-    end_time = db_now
-    start_time = end_time - timedelta(hours=24)
-    
-    start_str = start_time.strftime('%Y-%m-%d %H:%M:%S')
-    end_str = end_time.strftime('%Y-%m-%d %H:%M:%S')
-    
-    logger.info(f"Using database time window: {start_str} to {end_str}")
-    
-    results = {}
-    
-    # Try to recover central if healthy
-    if check_pool_health(central_pool):
-        logger.info("Central is online - checking for missing data...")
-        try:
-            result = recover_missing_to_central(start_str, end_str)
-            if result['synced'] > 0:
-                results['central'] = result
-        except Exception as e:
-            logger.error(f"Failed to recover central: {e}")
-    
-    # Try to recover node2 if healthy
-    if check_pool_health(node2_pool):
-        logger.info("Node2 is online - checking for missing data...")
-        try:
-            result = recover_missing_to_partition(start_str, end_str, 2024, node2_pool, 'node2')
-            if result['synced'] > 0:
-                results['node2'] = result
-        except Exception as e:
-            logger.error(f"Failed to recover node2: {e}")
-    
-    # Try to recover node3 if healthy
-    if check_pool_health(node3_pool):
-        logger.info("Node3 is online - checking for missing data...")
-        try:
-            result = recover_missing_to_partition(start_str, end_str, 2025, node3_pool, 'node3')
-            if result['synced'] > 0:
-                results['node3'] = result
-        except Exception as e:
-            logger.error(f"Failed to recover node3: {e}")
-    
-    return results
+        logger.exception(f"Recovery failed: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/recovery/clear', methods=['POST'])
+def clear_downtime_tracker():
+    """Clear downtime tracker (admin function)"""
+    global downtime_tracker
+    downtime_tracker = {'central': None, 'node2': None, 'node3': None}
+    return jsonify({"success": True, "message": "Downtime tracker cleared"}), 200
 
 # ========================================================================
 # MAIN
