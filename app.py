@@ -37,6 +37,7 @@ def create_connection_pool(host, user, password, database, port=3306, pool_name=
             autocommit=False,
             buffered=True,
             consume_results=True
+            pool_recycle=299
         )
         logger.info(f"Created connection pool for {host}:{port}")
         return pool
@@ -317,7 +318,7 @@ def determine_partition_node(delivery_date):
             year = delivery_date.year
         
         if year == 2024:
-            return None
+            return node2_pool
         elif year == 2025:
             return node3_pool
         else:
@@ -331,10 +332,12 @@ def determine_partition_node(delivery_date):
 # ========================================================================
 
 downtime_tracker = {'central': None, 'node2': None, 'node3': None}
+downtime_lock = threading.Lock()
 
 def log_node_failure(node_name):
-    downtime_tracker[node_name] = datetime.now()
-    logger.warning(f"Node {node_name} failure detected at {downtime_tracker[node_name]}")
+    with downtime_lock:
+        downtime_tracker[node_name] = datetime.now()
+        logger.warning(f"Node {node_name} failure detected at {downtime_tracker[node_name]}")
 
 def recover_missing_to_central(start_time, end_time):
     logger.info(f"Starting recovery to central from {start_time} to {end_time}")
@@ -342,6 +345,7 @@ def recover_missing_to_central(start_time, end_time):
     for node_name, node_pool in [('node2', node2_pool), ('node3', node3_pool)]:
         try:
             with get_connection(node_pool) as conn_partition:
+                conn_partition.start_transaction(isolation_level='REPEATABLE READ')
                 cursor_partition = conn_partition.cursor()
                 cursor_partition.execute("SELECT orderID, userID, deliveryDate, riderID, createdAt, updatedAt, productID, quantity FROM FactOrders WHERE updatedAt BETWEEN %s AND %s", (start_time, end_time))
                 orders = cursor_partition.fetchall()
@@ -556,7 +560,9 @@ def insert_order():
                 elif year == 2025:
                     log_node_failure('node3')
         else:
+            logger.warning(f"No partition pool available for date {delivery_date}")
             partition_success = False
+            partition_conn = None
             year = int(delivery_date[:4])
             if year == 2024:
                 log_node_failure('node2')
@@ -618,6 +624,8 @@ def insert_order():
         lock_mgr.rollback_all()
         lock_mgr.release_all()
         return jsonify({"error": str(e)}), 500
+    finally:  
+        lock_mgr.release_all()
 
 @app.route('/api/read', methods=['POST'])
 def read_order():
