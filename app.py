@@ -36,7 +36,7 @@ def create_connection_pool(host, user, password, database, port=3306, pool_name=
             port=port,
             autocommit=False,
             buffered=True,
-            consume_results=True
+            consume_results=True,
             pool_recycle=299
         )
         logger.info(f"Created connection pool for {host}:{port}")
