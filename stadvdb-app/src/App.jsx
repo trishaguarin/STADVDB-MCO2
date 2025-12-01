@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Database, Plus, Search, Edit, Trash2, Server, CheckCircle, XCircle, Loader } from 'lucide-react';
+import { Database, Plus, Search, Edit, Trash2, Server, CheckCircle, XCircle, Loader, Lock, Unlock } from 'lucide-react';
 import './App.css';
 
 const ConcurrencyWarnings = ({ concurrencyInfo }) => {
@@ -10,7 +10,8 @@ const ConcurrencyWarnings = ({ concurrencyInfo }) => {
     phantom_warning,
     dirty_read_warning,
     non_repeatable_warning,
-    concurrency_note
+    concurrency_note,
+    locking_info
   } = concurrencyInfo;
 
   const warnings = [];
@@ -49,6 +50,11 @@ const ConcurrencyWarnings = ({ concurrencyInfo }) => {
           </ul>
         </div>
       ))}
+      {locking_info && (
+        <div className="locking-info-badge">
+          <strong>🔒 Locking Status:</strong> {locking_info}
+        </div>
+      )}
     </div>
   );
 };
@@ -59,15 +65,24 @@ const formatResponse = (response, operation) => {
   const transactionTimeDisplay = response.transaction_time_ms ? (
     <div className="transaction-time">
       <strong>Transaction Time:</strong> {response.transaction_time_ms.toFixed(2)} ms
+      {response.locking_used !== undefined && (
+        <span className="locking-status">
+          {response.locking_used ? '🔒 Locking Enabled' : '🔓 No Locking'}
+        </span>
+      )}
+      {response.nodes_locked > 0 && (
+        <span className="locking-status">
+          Nodes Locked: {response.nodes_locked}
+        </span>
+      )}
     </div>
   ) : null;
 
   if (operation === 'read' && response.results) {
     return (
-      <div className="read-response">
+      <div>
         {transactionTimeDisplay}
         
-        {/* Show warnings for READ operations */}
         {response.concurrency_info && (
           <ConcurrencyWarnings concurrencyInfo={response.concurrency_info} />
         )}
@@ -115,33 +130,25 @@ const formatResponse = (response, operation) => {
     );
   }
 
-
   if (response.message) {
     return (
-    <div className="operation-response">
-      {transactionTimeDisplay}
-      
-      {/* Show concurrency warnings */}
-      {response.concurrency_info && (
-        <ConcurrencyWarnings concurrencyInfo={response.concurrency_info} />
-      )}
+      <div>
+        {transactionTimeDisplay}
+        
+        {response.concurrency_info && (
+          <ConcurrencyWarnings concurrencyInfo={response.concurrency_info} />
+        )}
 
-      <p className="success-message">{response.message}</p>
-        {response.results && (
-          <div className="operation-details">
-            {Object.entries(response.results).map(([node, result]) => (
-              <div key={node} className="node-result">
-                <h4>{node.toUpperCase()}:</h4>
-                <p><strong>Status:</strong> {result.status}</p>
-                {result.message && <p>{result.message}</p>}
-                {result.data && (
-                  <div className="node-data">
-                    <p><strong>Order ID:</strong> {result.data.orderID}</p>
-                    {result.data.deliveryDate && (
-                      <p><strong>Delivery Date:</strong> {new Date(result.data.deliveryDate).toLocaleDateString()}</p>
-                    )}
-                  </div>
-                )}
+        <p style={{ color: '#155724', fontWeight: 'bold', marginTop: '12px' }}>
+          {response.message}
+        </p>
+        
+        {response.deletion_results && (
+          <div className="deletion-results">
+            <h4>Deletion Results:</h4>
+            {Object.entries(response.deletion_results).map(([node, result]) => (
+              <div key={node} className="deletion-result-item">
+                <strong>{node.toUpperCase()}:</strong> {result}
               </div>
             ))}
           </div>
@@ -158,9 +165,9 @@ const App = () => {
   const [operation, setOperation] = useState('');
   const [orderId, setOrderId] = useState('');
   const [deliveryDate, setDeliveryDate] = useState('');
+  const [useLocking, setUseLocking] = useState(true);
   const [loading, setLoading] = useState(false);
   const [response, setResponse] = useState(null);
-  const [transactionTime, setTransactionTime] = useState(null);
   const [error, setError] = useState('');
 
   const isolationLevels = {
@@ -186,7 +193,8 @@ const App = () => {
       const endpoint = `${API_BASE_URL}/${operation}`;
       const body = {
         isolation_level: isolationLevels[isolationLevel],
-        order_id: parseInt(orderId)
+        order_id: parseInt(orderId),
+        use_locking: useLocking
       };
 
       if (operation === 'insert' || operation === 'update') {
@@ -236,7 +244,7 @@ const App = () => {
             <Database size={40} className="header-icon" />
             <div>
               <h1 className="header-title">Distributed Database Management System</h1>
-              <p className="header-subtitle">STADVDB MCO2 - Multi-Node Transaction Manager</p>
+              <p className="header-subtitle">STADVDB MCO2 - Multi-Node Transaction Manager with Locking</p>
             </div>
           </div>
         </header>
@@ -249,7 +257,7 @@ const App = () => {
               <div className="node-name">Central Node</div>
               <div className="node-info">10.2.14.120:3306</div>
             </div>
-            <CheckCircle size={20} className="status-icon status-active" />
+            <CheckCircle size={20} className="status-icon" />
           </div>
           <div className="node-card">
             <Server size={20} />
@@ -257,7 +265,7 @@ const App = () => {
               <div className="node-name">Node 2 (2024)</div>
               <div className="node-info">10.2.14.121:3306</div>
             </div>
-            <CheckCircle size={20} className="status-icon status-active" />
+            <CheckCircle size={20} className="status-icon" />
           </div>
           <div className="node-card">
             <Server size={20} />
@@ -265,7 +273,7 @@ const App = () => {
               <div className="node-name">Node 3 (2025)</div>
               <div className="node-info">10.2.14.122:3306</div>
             </div>
-            <CheckCircle size={20} className="status-icon status-active" />
+            <CheckCircle size={20} className="status-icon" />
           </div>
         </div>
 
@@ -334,68 +342,87 @@ const App = () => {
               </button>
             </div>
 
-            <div className="form">
-              <div className="form-group">
-                <label htmlFor="orderId" className="form-label">Order ID</label>
-                <input
-                  id="orderId"
-                  type="number"
-                  value={orderId}
-                  onChange={(e) => setOrderId(e.target.value)}
-                  placeholder="Enter Order ID"
-                  className="form-input"
-                />
-              </div>
-
-              {(operation === 'insert' || operation === 'update') && (
-                <div className="form-group">
-                  <label htmlFor="deliveryDate" className="form-label">Delivery Date</label>
-                  <input
-                    id="deliveryDate"
-                    type="date"
-                    value={deliveryDate}
-                    onChange={(e) => setDeliveryDate(e.target.value)}
-                    className="form-input"
-                  />
-                  <p className="form-hint">
-                    Year 2024 → Node 2 | Year 2025 → Node 3
+            {/* Locking Toggle */}
+            <div className={`locking-toggle ${useLocking ? 'enabled' : 'disabled'}`}>
+              <div className={`locking-content ${useLocking ? 'enabled' : 'disabled'}`}>
+                {useLocking ? <Lock size={24} /> : <Unlock size={24} />}
+                <div className="locking-info">
+                  <h3 className="locking-title">
+                    Locking Strategy: {useLocking ? 'ENABLED' : 'DISABLED'}
+                  </h3>
+                  <p className="locking-description">
+                    {useLocking 
+                      ? 'Distributed locks will be acquired across nodes to prevent conflicts'
+                      : 'No explicit locking - relying only on isolation level'
+                    }
                   </p>
                 </div>
-              )}
-
-              <div className="form-actions">
                 <button
-                  onClick={handleSubmit}
-                  disabled={loading}
-                  className="btn-primary"
+                  onClick={() => setUseLocking(!useLocking)}
+                  className={`locking-toggle-btn ${useLocking ? 'enabled' : 'disabled'}`}
                 >
-                  {loading ? (
-                    <>
-                      <Loader className="spinner" size={20} />
-                      Processing...
-                    </>
-                  ) : (
-                    `Execute ${operation.charAt(0).toUpperCase() + operation.slice(1)}`
-                  )}
-                </button>
-                <button
-                  onClick={resetForm}
-                  className="btn-secondary"
-                >
-                  Clear
+                  Toggle
                 </button>
               </div>
+            </div>
+
+            <div className="form-group">
+              <label htmlFor="orderId" className="form-label">Order ID</label>
+              <input
+                id="orderId"
+                type="number"
+                value={orderId}
+                onChange={(e) => setOrderId(e.target.value)}
+                placeholder="Enter Order ID"
+                className="form-input"
+              />
+            </div>
+
+            {(operation === 'insert' || operation === 'update') && (
+              <div className="form-group">
+                <label htmlFor="deliveryDate" className="form-label">Delivery Date</label>
+                <input
+                  id="deliveryDate"
+                  type="date"
+                  value={deliveryDate}
+                  onChange={(e) => setDeliveryDate(e.target.value)}
+                  className="form-input"
+                />
+                <p className="form-hint">
+                  Year 2024 → Node 2 | Year 2025 → Node 3
+                </p>
+              </div>
+            )}
+
+            <div className="form-actions">
+              <button
+                onClick={handleSubmit}
+                disabled={loading}
+                className="btn-primary"
+              >
+                {loading ? (
+                  <>
+                    <Loader className="spinner" size={20} />
+                    Processing...
+                  </>
+                ) : (
+                  `Execute ${operation.charAt(0).toUpperCase() + operation.slice(1)}`
+                )}
+              </button>
+              <button onClick={resetForm} className="btn-secondary">
+                Clear
+              </button>
             </div>
 
             {/* Response Display */}
             {response && (
               <div className="response response-success">
-                <CheckCircle size={20} />
+                <div className="response-header">
+                  <CheckCircle size={24} />
+                  <h3 className="response-title">Operation Successful</h3>
+                </div>
                 <div className="response-content">
-                  <div className="response-title">Operation Successful</div>
-                  <div className="response-details">
-                    {formatResponse(response, operation)}
-                  </div>
+                  {formatResponse(response, operation)}
                 </div>
               </div>
             )}
@@ -403,19 +430,18 @@ const App = () => {
             {/* Error Display */}
             {error && (
               <div className="response response-error">
-                <XCircle size={20} />
-                <div>
-                  <div className="response-title">Error</div>
-                  <div className="response-content">{error}</div>
+                <div className="response-header">
+                  <XCircle size={24} />
+                  <div>
+                    <h3 className="response-title">Error</h3>
+                    <p className="response-content">{error}</p>
+                  </div>
                 </div>
               </div>
             )}
           </div>
         )}
-
-       
       </div>
-
     </div>
   );
 };

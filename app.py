@@ -5,6 +5,7 @@ from mysql.connector import Error, pooling
 import logging
 from datetime import datetime
 from contextlib import contextmanager
+import time
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -17,7 +18,6 @@ CORS(app)
 # DATABASE CONNECTION
 # ========================================================================
 
-# Connection pool configuration
 POOL_SIZE = 5
 POOL_RESET_SESSION = True
 
@@ -100,6 +100,114 @@ def check_pool_health(pool):
     except Error as e:
         logger.error(f"Connection pool health check failed: {e}")
         return False
+
+# ========================================================================
+# LOCKING MECHANISMS
+# ========================================================================
+
+def acquire_row_lock(conn, order_id, lock_type='FOR UPDATE'):
+    """
+    Acquire a row-level lock on a specific order
+    lock_type: 'FOR UPDATE' (exclusive) or 'LOCK IN SHARE MODE' (shared)
+    """
+    try:
+        cursor = conn.cursor()
+        if lock_type == 'FOR UPDATE':
+            # Exclusive lock - blocks both reads and writes
+            cursor.execute(
+                "SELECT orderID FROM FactOrders WHERE orderID = %s FOR UPDATE",
+                (order_id,)
+            )
+            logger.info(f"Acquired exclusive lock on order {order_id}")
+        else:
+            # Shared lock - allows other shared locks but blocks exclusive locks
+            cursor.execute(
+                "SELECT orderID FROM FactOrders WHERE orderID = %s LOCK IN SHARE MODE",
+                (order_id,)
+            )
+            logger.info(f"Acquired shared lock on order {order_id}")
+        
+        result = cursor.fetchone()
+        cursor.close()
+        return result is not None
+    except Error as e:
+        logger.error(f"Failed to acquire lock on order {order_id}: {e}")
+        raise
+
+def acquire_table_lock(conn, lock_type='WRITE'):
+    """
+    Acquire a table-level lock
+    lock_type: 'READ' or 'WRITE'
+    Note: Table locks should be released with release_table_lock()
+    """
+    try:
+        cursor = conn.cursor()
+        cursor.execute(f"LOCK TABLES FactOrders {lock_type}")
+        cursor.close()
+        logger.info(f"Acquired {lock_type} table lock")
+        return True
+    except Error as e:
+        logger.error(f"Failed to acquire table lock: {e}")
+        raise
+
+def release_table_lock(conn):
+    """Release all table locks"""
+    try:
+        cursor = conn.cursor()
+        cursor.execute("UNLOCK TABLES")
+        cursor.close()
+        logger.info("Released table locks")
+        return True
+    except Error as e:
+        logger.error(f"Failed to release table locks: {e}")
+        raise
+
+def acquire_distributed_lock(order_id, pools, lock_type='FOR UPDATE', timeout=10):
+    """
+    Acquire locks across multiple nodes in a specific order to prevent deadlocks
+    Returns list of connections with acquired locks
+    """
+    locked_connections = []
+    start_time = time.time()
+    
+    try:
+        # Always acquire locks in the same order: central -> node2 -> node3
+        # This prevents circular wait conditions (deadlock prevention)
+        for pool in pools:
+            if pool is None:
+                continue
+                
+            if time.time() - start_time > timeout:
+                raise Exception(f"Lock acquisition timeout after {timeout}s")
+            
+            conn = pool.get_connection()
+            locked_connections.append(conn)
+            
+            # Acquire lock on this node
+            acquire_row_lock(conn, order_id, lock_type)
+        
+        logger.info(f"Successfully acquired distributed locks for order {order_id}")
+        return locked_connections
+        
+    except Exception as e:
+        # If we fail to acquire all locks, release what we have
+        logger.error(f"Failed to acquire distributed locks: {e}")
+        for conn in locked_connections:
+            try:
+                conn.rollback()
+                conn.close()
+            except:
+                pass
+        raise
+
+def release_distributed_locks(connections):
+    """Release all distributed locks by committing/rolling back and closing connections"""
+    for conn in connections:
+        try:
+            if conn and conn.is_connected():
+                conn.close()
+        except Exception as e:
+            logger.error(f"Error releasing lock: {e}")
 
 # ========================================================================
 # ISOLATION LEVEL HANDLING
@@ -198,7 +306,6 @@ def get_delete_concurrency_note(level):
         }
     return None
 
-
 # ========================================================================
 # PARTITIONING LOGIC
 # ========================================================================
@@ -222,19 +329,32 @@ def determine_partition_node(delivery_date):
         return None
 
 # ========================================================================
-# REPLICATION FUNCTIONS
+# REPLICATION FUNCTIONS (WITH LOCKING)
 # ========================================================================
 
-def replicate_insert_to_central(order_id, delivery_date, level):
-    """Replicate insert from partition node to central node"""
+def replicate_insert_to_central(order_id, delivery_date, level, use_locking=True):
+    """Replicate insert from partition node to central node with optional locking"""
     conn = None
     try:
         conn = central_pool.get_connection()
         if not set_isolation_level(conn, level):
             logger.error("Failed to set isolation level for central node")
             return False
-            
+        
+        # Start transaction
         cursor = conn.cursor()
+        
+        # Optional: Acquire lock before insert
+        if use_locking:
+            # Check if order exists and lock if it does
+            cursor.execute(
+                "SELECT orderID FROM FactOrders WHERE orderID = %s FOR UPDATE",
+                (order_id,)
+            )
+            if cursor.fetchone():
+                logger.warning(f"Order {order_id} already exists in central, skipping insert")
+                cursor.close()
+                return True
         
         sql = """
         INSERT INTO FactOrders (orderID, userID, deliveryDate, riderID, createdAt, updatedAt, productID, quantity)
@@ -258,8 +378,8 @@ def replicate_insert_to_central(order_id, delivery_date, level):
         if conn and conn.is_connected():
             conn.close()
 
-def replicate_insert_to_partition(order_id, delivery_date, level):
-    """Replicate insert from central node to partition node"""
+def replicate_insert_to_partition(order_id, delivery_date, level, use_locking=True):
+    """Replicate insert from central node to partition node with optional locking"""
     conn = None
     try:
         if not delivery_date:
@@ -290,8 +410,19 @@ def replicate_insert_to_partition(order_id, delivery_date, level):
         if not set_isolation_level(conn, level):
             logger.error("Failed to set isolation level for partition node")
             return False
-            
+        
         cursor = conn.cursor()
+        
+        # Optional: Acquire lock before insert
+        if use_locking:
+            cursor.execute(
+                "SELECT orderID FROM FactOrders WHERE orderID = %s FOR UPDATE",
+                (order_id,)
+            )
+            if cursor.fetchone():
+                logger.warning(f"Order {order_id} already exists in partition, skipping insert")
+                cursor.close()
+                return True
         
         sql = """
         INSERT INTO FactOrders (orderID, userID, deliveryDate, riderID, createdAt, updatedAt, productID, quantity)
@@ -333,16 +464,16 @@ def health_check():
 
 @app.route('/api/insert', methods=['POST'])
 def insert_order():
-    """Insert a new order"""
-
+    """Insert a new order with optional locking"""
     start_time = datetime.now()
-
     conn = None
+    
     try:
         data = request.json
         order_id = int(data.get('order_id'))
         delivery_date = data.get('delivery_date')
         isolation_level = data.get('isolation_level', 'READ COMMITTED')
+        use_locking = data.get('use_locking', True)  # New parameter
         
         if not order_id or not delivery_date:
             return jsonify({"error": "Missing required fields"}), 400
@@ -352,17 +483,30 @@ def insert_order():
         try:
             conn = central_pool.get_connection()
             
+            # Set isolation level
+            if not set_isolation_level(conn, isolation_level):
+                return jsonify({"error": "Failed to set isolation level"}), 500
+            
             cursor = conn.cursor()
-            cursor.execute("SELECT 1 FROM FactOrders WHERE orderID = %s", (order_id,))
+            
+            # Check for existing order (with optional lock)
+            if use_locking:
+                # Use FOR UPDATE to prevent concurrent inserts
+                cursor.execute(
+                    "SELECT 1 FROM FactOrders WHERE orderID = %s FOR UPDATE",
+                    (order_id,)
+                )
+            else:
+                cursor.execute(
+                    "SELECT 1 FROM FactOrders WHERE orderID = %s",
+                    (order_id,)
+                )
+            
             if cursor.fetchone():
                 cursor.close()
                 return jsonify({"error": "OrderID already exists"}), 400
-            cursor.close()
             
-            if not set_isolation_level(conn, isolation_level):
-                return jsonify({"error": "Failed to set isolation level"}), 500
-                
-            cursor = conn.cursor()
+            # Insert into central node
             sql = """
             INSERT INTO FactOrders (orderID, userID, deliveryDate, riderID, createdAt, updatedAt, productID, quantity)
             VALUES (%s, 0, %s, 0, NOW(), NOW(), 0, 1)
@@ -373,7 +517,10 @@ def insert_order():
             cursor.close()
             logger.info(f"Inserted order {order_id} into central node")
             
-            replication_success = replicate_insert_to_partition(order_id, delivery_date, isolation_level)
+            # Replicate to partition
+            replication_success = replicate_insert_to_partition(
+                order_id, delivery_date, isolation_level, use_locking
+            )
             
             # Check for concurrency issues
             year = int(delivery_date[:4])
@@ -387,10 +534,12 @@ def insert_order():
                 "message": "Order inserted successfully",
                 "order_id": order_id,
                 "replication_status": "success" if replication_success else "partial",
+                "locking_used": use_locking,
                 "transaction_time_ms": duration_ms,
                 "concurrency_info": {
                     "isolation_warnings": warnings_info,
-                    "phantom_warning": phantom_warning
+                    "phantom_warning": phantom_warning,
+                    "locking_info": "Row-level locks used" if use_locking else "No explicit locking"
                 }
             }
             
@@ -413,7 +562,7 @@ def insert_order():
 
 @app.route('/api/read', methods=['POST'])
 def read_order():
-    """Read an order from all nodes"""
+    """Read an order from all nodes with optional shared locking"""
     start_time = datetime.now()
     results = {}
     
@@ -421,15 +570,14 @@ def read_order():
         data = request.json
         order_id = int(data.get('order_id'))
         isolation_level = data.get('isolation_level', 'READ COMMITTED')
+        use_locking = data.get('use_locking', False)  # Shared lock for consistent reads
         
         if not order_id:
             return jsonify({"error": "Missing order_id"}), 400
         
-        warnings_info = get_isolation_warnings(isolation_level, "insert")
-        
+        warnings_info = get_isolation_warnings(isolation_level, "read")
         found = False
         
-        # Check all nodes
         nodes = [
             ("central", central_pool),
             ("node2", node2_pool),
@@ -445,18 +593,33 @@ def read_order():
                     continue
                             
                 cursor = conn.cursor(dictionary=True)
-                # For central node, only select orderID and deliveryDate
-                if label == "central":
-                    cursor.execute(
-                        "SELECT orderID, deliveryDate FROM FactOrders WHERE orderID = %s",
-                        (order_id,)
-                    )
+                
+                # Use LOCK IN SHARE MODE for consistent reads if locking is enabled
+                if use_locking:
+                    if label == "central":
+                        cursor.execute(
+                            "SELECT orderID, deliveryDate FROM FactOrders WHERE orderID = %s LOCK IN SHARE MODE",
+                            (order_id,)
+                        )
+                    else:
+                        cursor.execute(
+                            "SELECT orderID, deliveryDate, createdAt, updatedAt FROM FactOrders WHERE orderID = %s LOCK IN SHARE MODE",
+                            (order_id,)
+                        )
                 else:
-                    cursor.execute(
-                        "SELECT orderID, deliveryDate, createdAt, updatedAt FROM FactOrders WHERE orderID = %s",
-                        (order_id,)
-                    )
+                    if label == "central":
+                        cursor.execute(
+                            "SELECT orderID, deliveryDate FROM FactOrders WHERE orderID = %s",
+                            (order_id,)
+                        )
+                    else:
+                        cursor.execute(
+                            "SELECT orderID, deliveryDate, createdAt, updatedAt FROM FactOrders WHERE orderID = %s",
+                            (order_id,)
+                        )
+                
                 row = cursor.fetchone()
+                conn.commit()  # Release shared lock
                 cursor.close()
                 
                 if row:
@@ -494,7 +657,6 @@ def read_order():
             }), 404
         
         concurrency_note = get_read_concurrency_note(isolation_level)
-
         end_time = datetime.now()  
         duration_ms = (end_time - start_time).total_seconds() * 1000
 
@@ -503,10 +665,12 @@ def read_order():
             "message": "Order retrieved successfully",
             "order_id": order_id,
             "results": results,
+            "locking_used": use_locking,
             "transaction_time_ms": duration_ms,
             "concurrency_info": {
                 "isolation_warnings": warnings_info,
-                "concurrency_note": concurrency_note
+                "concurrency_note": concurrency_note,
+                "locking_info": "Shared locks used" if use_locking else "No explicit locking"
             }
         }), 200
         
@@ -515,40 +679,35 @@ def read_order():
     except Exception as e:
         logger.exception(f"Read failed: {e}")
         return jsonify({"error": "An unexpected error occurred"}), 500
-    
-    
+
 @app.route('/api/update', methods=['POST'])
 def update_order():
-    """Update an order with concurrency detection"""
+    """Update an order with distributed locking for consistency"""
     start_time = datetime.now()
-    conn_central = None
-    conn_old_part = None
-    conn_new_part = None
+    locked_connections = []
     
     try:
         data = request.json
         order_id = int(data.get('order_id'))
         new_delivery_date = data.get('delivery_date')
         isolation_level = data.get('isolation_level', 'READ COMMITTED')
+        use_locking = data.get('use_locking', True)
         
         if not order_id or not new_delivery_date:
             return jsonify({"error": "Missing required fields"}), 400
         
-        # Get isolation warnings
         warnings_info = get_isolation_warnings(isolation_level, "update")
         
-        try:
-            conn_central = central_pool.get_connection()
-            if not set_isolation_level(conn_central, isolation_level):
-                return jsonify({"error": "Failed to set isolation level"}), 500
-        except Error as e:
-            logger.error(f"Failed to connect to central node: {e}")
-            return jsonify({"error": "Central node unavailable"}), 503
+        # Determine which nodes need to be locked
+        nodes_to_lock = [central_pool]
         
-        cursor = conn_central.cursor()
+        # Get old delivery date first (without lock for now)
+        conn_check = central_pool.get_connection()
+        cursor = conn_check.cursor()
         cursor.execute("SELECT deliveryDate FROM FactOrders WHERE orderID = %s", (order_id,))
         result = cursor.fetchone()
         cursor.close()
+        conn_check.close()
         
         if not result:
             return jsonify({"error": "OrderID does not exist"}), 404
@@ -557,82 +716,110 @@ def update_order():
         old_year = int(str(old_delivery_date)[:4])
         new_year = int(new_delivery_date[:4])
         
-        # Check for dirty read warning
-        dirty_read_warning = check_for_dirty_read_uncommitted(order_id, isolation_level)
-        
         old_partition = determine_partition_node(old_delivery_date)
         new_partition = determine_partition_node(new_delivery_date)
         
+        # Add partition nodes to lock list
+        if old_partition and old_partition not in nodes_to_lock:
+            nodes_to_lock.append(old_partition)
+        if new_partition and new_partition not in nodes_to_lock and new_partition != old_partition:
+            nodes_to_lock.append(new_partition)
+        
+        if use_locking:
+            # Acquire distributed locks across all relevant nodes
+            try:
+                locked_connections = acquire_distributed_lock(
+                    order_id, 
+                    nodes_to_lock, 
+                    'FOR UPDATE',
+                    timeout=10
+                )
+                
+                # Set isolation level on all connections
+                for conn in locked_connections:
+                    set_isolation_level(conn, isolation_level)
+                
+            except Exception as e:
+                logger.error(f"Failed to acquire distributed locks: {e}")
+                return jsonify({"error": "Failed to acquire locks for update"}), 500
+        else:
+            # No locking - just get connections
+            for pool in nodes_to_lock:
+                conn = pool.get_connection()
+                set_isolation_level(conn, isolation_level)
+                locked_connections.append(conn)
+        
+        # Now perform the updates with locks held
+        dirty_read_warning = check_for_dirty_read_uncommitted(order_id, isolation_level)
+        
+        # Handle year change (move between partitions)
         if old_year != new_year and old_partition and new_partition:
-            logger.info(f"Year changed from {old_year} to {new_year}")
+            logger.info(f"Year changed from {old_year} to {new_year} - moving partitions")
             
-            try:
-                conn_new_part = new_partition.get_connection()
-                if set_isolation_level(conn_new_part, isolation_level):
-                    cursor = conn_new_part.cursor()
-                    sql = """
-                    INSERT INTO FactOrders (orderID, userID, deliveryDate, riderID, createdAt, updatedAt, productID, quantity)
-                    VALUES (%s, 0, %s, 0, NOW(), NOW(), 0, 1)
-                    """
-                    cursor.execute(sql, (order_id, new_delivery_date))
-                    conn_new_part.commit()
-                    cursor.close()
-            except Error as e:
-                logger.error(f"Failed to insert into new partition: {e}")
-                if conn_new_part and conn_new_part.is_connected():
-                    conn_new_part.rollback()
-                return jsonify({"error": "Failed to update partition"}), 500
+            # Find the new partition connection
+            new_part_conn = None
+            for conn in locked_connections:
+                if conn.pool_name == new_partition.pool_name:
+                    new_part_conn = conn
+                    break
             
-            try:
-                conn_old_part = old_partition.get_connection()
-                if set_isolation_level(conn_old_part, isolation_level):
-                    cursor = conn_old_part.cursor()
-                    cursor.execute("DELETE FROM FactOrders WHERE orderID = %s", (order_id,))
-                    conn_old_part.commit()
-                    cursor.close()
-            except Error as e:
-                logger.error(f"Failed to delete from old partition: {e}")
-                if conn_old_part and conn_old_part.is_connected():
-                    conn_old_part.rollback()
+            if new_part_conn:
+                cursor = new_part_conn.cursor()
+                sql = """
+                INSERT INTO FactOrders (orderID, userID, deliveryDate, riderID, createdAt, updatedAt, productID, quantity)
+                VALUES (%s, 0, %s, 0, NOW(), NOW(), 0, 1)
+                """
+                cursor.execute(sql, (order_id, new_delivery_date))
+                new_part_conn.commit()
+                cursor.close()
+            
+            # Delete from old partition
+            old_part_conn = None
+            for conn in locked_connections:
+                if conn.pool_name == old_partition.pool_name:
+                    old_part_conn = conn
+                    break
+            
+            if old_part_conn:
+                cursor = old_part_conn.cursor()
+                cursor.execute("DELETE FROM FactOrders WHERE orderID = %s", (order_id,))
+                old_part_conn.commit()
+                cursor.close()
         
-        try:
-            cursor = conn_central.cursor()
-            sql = """
-            UPDATE FactOrders
-            SET deliveryDate = %s, updatedAt = NOW()
-            WHERE orderID = %s
-            """
-            cursor.execute(sql, (new_delivery_date, order_id))
-            conn_central.commit()
-            cursor.close()
-        except Error as e:
-            logger.error(f"Failed to update central node: {e}")
-            conn_central.rollback()
-            return jsonify({"error": "Failed to update order"}), 500
+        # Update central node
+        central_conn = locked_connections[0]  # Central is always first
+        cursor = central_conn.cursor()
+        sql = """
+        UPDATE FactOrders
+        SET deliveryDate = %s, updatedAt = NOW()
+        WHERE orderID = %s
+        """
+        cursor.execute(sql, (new_delivery_date, order_id))
+        central_conn.commit()
+        cursor.close()
         
+        # Update partition if same year
         if old_year == new_year and new_partition:
-            try:
-                conn_part = new_partition.get_connection()
-                if set_isolation_level(conn_part, isolation_level):
-                    cursor = conn_part.cursor()
+            for conn in locked_connections:
+                if conn.pool_name == new_partition.pool_name:
+                    cursor = conn.cursor()
                     sql = """
                     UPDATE FactOrders
                     SET deliveryDate = %s, updatedAt = NOW()
                     WHERE orderID = %s
                     """
                     cursor.execute(sql, (new_delivery_date, order_id))
-                    conn_part.commit()
+                    conn.commit()
                     cursor.close()
-            except Error as e:
-                logger.error(f"Failed to update partition node: {e}")
-                if conn_part and conn_part.is_connected():
-                    conn_part.rollback()
+                    break
         
-        # Check for non-repeatable read warning
+        # Release all locks
+        release_distributed_locks(locked_connections)
+        
         non_repeatable_warning = check_for_non_repeatable_read_update(
             order_id, old_delivery_date, new_delivery_date, isolation_level
         )
-
+        
         end_time = datetime.now()
         duration_ms = (end_time - start_time).total_seconds() * 1000
         
@@ -642,11 +829,14 @@ def update_order():
             "order_id": order_id,
             "old_date": str(old_delivery_date),
             "new_date": new_delivery_date,
+            "locking_used": use_locking,
+            "nodes_locked": len(locked_connections) if use_locking else 0,
             "transaction_time_ms": duration_ms,
             "concurrency_info": {
                 "isolation_warnings": warnings_info,
                 "dirty_read_warning": dirty_read_warning,
-                "non_repeatable_warning": non_repeatable_warning
+                "non_repeatable_warning": non_repeatable_warning,
+                "locking_info": f"Distributed locks across {len(locked_connections)} nodes" if use_locking else "No explicit locking"
             }
         }), 200
         
@@ -654,25 +844,26 @@ def update_order():
         return jsonify({"error": "Invalid input format"}), 400
     except Exception as e:
         logger.exception(f"Update failed: {e}")
+        # Ensure locks are released on error
+        release_distributed_locks(locked_connections)
         return jsonify({"error": "An unexpected error occurred"}), 500
-    finally:
-        for conn in [conn_central, conn_old_part, conn_new_part]:
-            if conn and conn.is_connected():
-                conn.close()
 
 @app.route('/api/delete', methods=['POST'])
 def delete_order():
-    """Delete an order from all nodes with concurrency detection"""
+    """Delete an order from all nodes with distributed locking"""
     start_time = datetime.now()
-
+    locked_connections = []
+    
     try:
         data = request.json
         order_id = int(data.get('order_id'))
         isolation_level = data.get('isolation_level', 'READ COMMITTED')
+        use_locking = data.get('use_locking', True)
         
         if not order_id:
             return jsonify({"error": "Missing order_id"}), 400
         
+        # Check existence
         exists = False
         try:
             with get_connection(central_pool) as conn:
@@ -694,35 +885,77 @@ def delete_order():
             ("node3", node3_pool)
         ]
         
-        for label, pool in nodes:
-            conn = None
+        if use_locking:
+            # Acquire distributed locks
             try:
-                conn = pool.get_connection()
-                if not set_isolation_level(conn, isolation_level):
-                    deletion_results[label] = "failed to set isolation level"
-                    continue
+                pools_to_lock = [pool for _, pool in nodes if pool is not None]
+                locked_connections = acquire_distributed_lock(
+                    order_id,
+                    pools_to_lock,
+                    'FOR UPDATE',
+                    timeout=10
+                )
                 
-                cursor = conn.cursor()
-                cursor.execute("DELETE FROM FactOrders WHERE orderID = %s", (order_id,))
-                conn.commit()
-                cursor.close()
-                deletion_results[label] = "success"
-                logger.info(f"Deleted order {order_id} from {label}")
-            except Error as e:
-                logger.error(f"Delete from {label} failed: {e}")
-                deletion_results[label] = f"error: {str(e)}"
-                if conn and conn.is_connected():
+                # Map connections back to node labels
+                conn_map = {}
+                for i, (label, pool) in enumerate(nodes):
+                    if pool is not None:
+                        for conn in locked_connections:
+                            if conn.pool_name == pool.pool_name:
+                                conn_map[label] = conn
+                                break
+                
+                # Delete from each node with lock held
+                for label, conn in conn_map.items():
                     try:
+                        set_isolation_level(conn, isolation_level)
+                        cursor = conn.cursor()
+                        cursor.execute("DELETE FROM FactOrders WHERE orderID = %s", (order_id,))
+                        conn.commit()
+                        cursor.close()
+                        deletion_results[label] = "success"
+                        logger.info(f"Deleted order {order_id} from {label}")
+                    except Error as e:
+                        logger.error(f"Delete from {label} failed: {e}")
+                        deletion_results[label] = f"error: {str(e)}"
                         conn.rollback()
-                    except:
-                        pass
-            finally:
-                if conn and conn.is_connected():
-                    conn.close()
+                
+                # Release locks
+                release_distributed_locks(locked_connections)
+                
+            except Exception as e:
+                logger.error(f"Failed to acquire distributed locks for delete: {e}")
+                release_distributed_locks(locked_connections)
+                return jsonify({"error": "Failed to acquire locks for deletion"}), 500
+        else:
+            # Delete without locking
+            for label, pool in nodes:
+                conn = None
+                try:
+                    conn = pool.get_connection()
+                    if not set_isolation_level(conn, isolation_level):
+                        deletion_results[label] = "failed to set isolation level"
+                        continue
+                    
+                    cursor = conn.cursor()
+                    cursor.execute("DELETE FROM FactOrders WHERE orderID = %s", (order_id,))
+                    conn.commit()
+                    cursor.close()
+                    deletion_results[label] = "success"
+                    logger.info(f"Deleted order {order_id} from {label}")
+                except Error as e:
+                    logger.error(f"Delete from {label} failed: {e}")
+                    deletion_results[label] = f"error: {str(e)}"
+                    if conn and conn.is_connected():
+                        try:
+                            conn.rollback()
+                        except:
+                            pass
+                finally:
+                    if conn and conn.is_connected():
+                        conn.close()
         
-        # Get concurrency note
         concurrency_note = get_delete_concurrency_note(isolation_level)
-        
         end_time = datetime.now()
         duration_ms = (end_time - start_time).total_seconds() * 1000
 
@@ -731,9 +964,11 @@ def delete_order():
             "message": "Order deleted successfully",
             "order_id": order_id,
             "deletion_results": deletion_results,
+            "locking_used": use_locking,
             "transaction_time_ms": duration_ms,
             "concurrency_info": {
-                "concurrency_note": concurrency_note
+                "concurrency_note": concurrency_note,
+                "locking_info": "Distributed locks used" if use_locking else "No explicit locking"
             }
         }), 200
         
@@ -741,6 +976,7 @@ def delete_order():
         return jsonify({"error": "Invalid order_id format"}), 400
     except Exception as e:
         logger.exception(f"Delete failed: {e}")
+        release_distributed_locks(locked_connections)
         return jsonify({"error": "An unexpected error occurred"}), 500
     
 # ========================================================================

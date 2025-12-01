@@ -558,3 +558,117 @@ button:focus, input:focus, select:focus, textarea:focus {
   margin: 0;
   padding-left: 20px;
 }
+
+
+/* Locking Toggle */
+.locking-toggle {
+  margin-bottom: 24px;
+  padding: 16px;
+  border-radius: 8px;
+  border: 2px solid;
+  transition: all 0.3s;
+}
+
+.locking-toggle.enabled {
+  background-color: #dbeafe;
+  border-color: #3b82f6;
+}
+
+.locking-toggle.disabled {
+  background-color: #fee2e2;
+  border-color: #ef4444;
+}
+
+.locking-content {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.locking-content svg {
+  flex-shrink: 0;
+}
+
+.locking-content.enabled svg {
+  color: #3b82f6;
+}
+
+.locking-content.disabled svg {
+  color: #ef4444;
+}
+
+.locking-info {
+  flex: 1;
+}
+
+.locking-title {
+  margin: 0 0 4px 0;
+  color: #1e293b;
+}
+
+.locking-description {
+  margin: 0;
+  font-size: 14px;
+  color: #64748b;
+}
+
+.locking-toggle-btn {
+  padding: 8px 16px;
+  color: white;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  font-weight: bold;
+  transition: opacity 0.2s;
+}
+
+.locking-toggle-btn.enabled {
+  background-color: #3b82f6;
+}
+
+.locking-toggle-btn.disabled {
+  background-color: #ef4444;
+}
+
+.locking-toggle-btn:hover {
+  opacity: 0.9;
+}
+
+.locking-info-badge {
+  margin-top: 12px;
+  padding: 8px;
+  background-color: #d1ecf1;
+  border-radius: 4px;
+  color: #0c5460;
+  font-size: 13px;
+}
+
+/* Deletion Results */
+.deletion-results {
+  margin-top: 12px;
+}
+
+.deletion-results h4 {
+  margin: 0 0 8px 0;
+  color: #1e293b;
+}
+
+.deletion-result-item {
+  padding: 8px;
+  background-color: #f8f9fa;
+  border-radius: 4px;
+  margin-bottom: 8px;
+}
+
+.deletion-result-item strong {
+  color: #1e293b;
+}
+
+ .locking-content {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .locking-toggle-btn {
+    width: 100%;
+  }
