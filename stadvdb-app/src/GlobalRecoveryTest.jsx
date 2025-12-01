@@ -142,6 +142,31 @@ const GlobalRecoveryTest = () => {
     }
   };
 
+  const handleMarkFailure = async (node) => {
+    setLoading(true);
+    setError('');
+    setResponse(null);
+    setSelectedCase(`fail-${node}`);
+
+    try {
+      const res = await fetch(`${API_BASE_URL}/recovery/mark/${node}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      });
+
+      const data = await res.json();
+      if (res.ok) {
+        setResponse(data);
+      } else {
+        setError(data.error || 'Failed to mark node as down');
+      }
+    } catch (err) {
+      setError(`Network error: ${err.message}`);
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const formatRecoveryResult = (result) => {
     if (!result) return null;
 
@@ -194,6 +219,36 @@ const GlobalRecoveryTest = () => {
               <h1 className="header-title">Global Failure Recovery Test Menu</h1>
               <p className="header-subtitle">Test distributed database recovery scenarios</p>
             </div>
+          </div>
+        </div>
+
+        {/* Failure Simulation Section */}
+        <div className="failure-section">
+          <h2 className="section-title">Simulate Node Failure</h2>
+          <div className="failure-buttons">
+            <button
+              onClick={() => handleMarkFailure("central")}
+              disabled={loading}
+              className="fail-button central-fail"
+            >
+              Fail Central Node
+            </button>
+
+            <button
+              onClick={() => handleMarkFailure("node2")}
+              disabled={loading}
+              className="fail-button node2-fail"
+            >
+              Fail Node 2
+            </button>
+
+            <button
+              onClick={() => handleMarkFailure("node3")}
+              disabled={loading}
+              className="fail-button node3-fail"
+            >
+              Fail Node 3
+            </button>
           </div>
         </div>
 

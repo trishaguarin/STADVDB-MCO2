@@ -7,6 +7,7 @@ from datetime import datetime
 from contextlib import contextmanager
 import time
 from datetime import timedelta
+from datetime import datetime, timezone
 import threading
 
 # Configure logging
@@ -16,6 +17,27 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 CORS(app)
 
+def normalize_delivery_date(date_str):
+    """
+    Converts date formats:
+    - '14/02/2024' → '2024-02-14'
+    - '2024-02-14' → '2024-02-14'
+    """
+
+    # Already ISO format (YYYY-MM-DD)
+    try:
+        datetime.strptime(date_str, "%Y-%m-%d")
+        return date_str
+    except:
+        pass
+
+    # Convert from DD/MM/YYYY to YYYY-MM-DD
+    try:
+        day, month, year = date_str.split("/")
+        return f"{year}-{month}-{day}"
+    except:
+        raise ValueError(f"Invalid delivery_date format: '{date_str}'. Expected DD/MM/YYYY or YYYY-MM-DD.")
+    
 # ========================================================================
 # DATABASE CONNECTION
 # ========================================================================
@@ -38,7 +60,6 @@ def create_connection_pool(host, user, password, database, port=3306, pool_name=
             autocommit=False,
             buffered=True,
             consume_results=True,
-            pool_recycle=299
         )
         logger.info(f"Created connection pool for {host}:{port}")
         return pool
@@ -337,7 +358,7 @@ downtime_lock = threading.Lock()
 
 def log_node_failure(node_name):
     with downtime_lock:
-        downtime_tracker[node_name] = datetime.now()
+        downtime_tracker[node_name] = datetime.now(timezone.utc)
         logger.warning(f"Node {node_name} failure detected at {downtime_tracker[node_name]}")
 
 def recover_missing_to_central(start_time, end_time):
@@ -425,17 +446,17 @@ def check_and_recover_all():
     recovery_results = {}
     if downtime_tracker['central'] and check_pool_health(central_pool):
         logger.info("Central is back online. Starting recovery...")
-        result = recover_missing_to_central(downtime_tracker['central'].strftime('%Y-%m-%d %H:%M:%S'), datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+        result = recover_missing_to_central(downtime_tracker['central'].strftime('%Y-%m-%d %H:%M:%S'), datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'))
         recovery_results['central'] = result
         downtime_tracker['central'] = None
     if downtime_tracker['node2'] and check_pool_health(node2_pool):
         logger.info("Node2 is back online. Starting recovery...")
-        result = recover_missing_to_partition(downtime_tracker['node2'].strftime('%Y-%m-%d %H:%M:%S'), datetime.now().strftime('%Y-%m-%d %H:%M:%S'), 2024, node2_pool, 'node2')
+        result = recover_missing_to_partition(downtime_tracker['node2'].strftime('%Y-%m-%d %H:%M:%S'), datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'), 2024, node2_pool, 'node2')
         recovery_results['node2'] = result
         downtime_tracker['node2'] = None
     if downtime_tracker['node3'] and check_pool_health(node3_pool):
         logger.info("Node3 is back online. Starting recovery...")
-        result = recover_missing_to_partition(downtime_tracker['node3'].strftime('%Y-%m-%d %H:%M:%S'), datetime.now().strftime('%Y-%m-%d %H:%M:%S'), 2025, node3_pool, 'node3')
+        result = recover_missing_to_partition(downtime_tracker['node3'].strftime('%Y-%m-%d %H:%M:%S'), datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'), 2025, node3_pool, 'node3')
         recovery_results['node3'] = result
         downtime_tracker['node3'] = None
     return recovery_results
@@ -451,7 +472,7 @@ def startup_recovery_check():
             start_time, end_time = row[0], row[1]
     except Exception as e:
         logger.error(f"Failed to get database time: {e}")
-        end_time = datetime.now()
+        end_time = datetime.now(timezone.utc)
         start_time = end_time - timedelta(hours=24)
     start_str, end_str = start_time.strftime('%Y-%m-%d %H:%M:%S'), end_time.strftime('%Y-%m-%d %H:%M:%S')
     logger.info(f"Using database time window: {start_str} to {end_str}")
@@ -501,13 +522,21 @@ def health_check():
 @app.route('/api/insert', methods=['POST'])
 def insert_order():
     """Insert a new order with 2PL"""
-    start_time = datetime.now()
+    
+    # Use UTC timestamp
+    start_time = datetime.now(timezone.utc)
     lock_mgr = TwoPhaseLockManager()
     
     try:
         data = request.json
         order_id = int(data.get('order_id'))
-        delivery_date = data.get('delivery_date')
+        raw_delivery_date = data.get("delivery_date")
+
+        try:
+            delivery_date = normalize_delivery_date(raw_delivery_date)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+
         isolation_level = data.get('isolation_level', 'READ COMMITTED')
         use_locking = data.get('use_locking', True)
         
@@ -515,15 +544,13 @@ def insert_order():
             return jsonify({"error": "Missing required fields"}), 400
         
         warnings_info = get_isolation_warnings(isolation_level, "insert")
-        
-        # ============ GROWING PHASE ============
+
         logger.info(f"[2PL] Starting GROWING phase for INSERT order {order_id}")
-        
-        # 1. Acquire connection to central node
+
+        # Acquire central connection + lock
         central_conn = lock_mgr.acquire_connection(central_pool)
         lock_mgr.set_isolation_level(central_conn, isolation_level)
-        
-        # 2. Acquire lock on central node (check for duplicate)
+
         if use_locking:
             result = lock_mgr.acquire_row_lock(central_conn, order_id, 'FOR UPDATE')
             if result:
@@ -535,103 +562,95 @@ def insert_order():
                 cursor.close()
                 return jsonify({"error": "OrderID already exists"}), 400
             cursor.close()
-        
-        # 3. Determine partition and acquire connection
+
+        # Determine target partition node
+        year = int(delivery_date[:4])
+        node_name = 'node2' if year == 2024 else 'node3'
+
         partition_pool = determine_partition_node(delivery_date)
         partition_conn = None
-        partition_success = True  # Track if partition replication succeeded
+        partition_success = True
 
-        if partition_pool:
+        # Simulated failure check
+        if downtime_tracker.get(node_name):
+            logger.warning(f"[SIMULATED FAILURE] {node_name} is DOWN. Skipping partition insert.")
+            partition_success = False
+        else:
             try:
-                partition_conn = lock_mgr.acquire_connection(partition_pool)
-                lock_mgr.set_isolation_level(partition_conn, isolation_level)
-                
-                # 4. Acquire lock on partition node
-                if use_locking:
-                    lock_mgr.acquire_row_lock(partition_conn, order_id, 'FOR UPDATE')
+                if partition_pool:
+                    partition_conn = lock_mgr.acquire_connection(partition_pool)
+                    lock_mgr.set_isolation_level(partition_conn, isolation_level)
+
+                    if use_locking:
+                        lock_mgr.acquire_row_lock(partition_conn, order_id, 'FOR UPDATE')
+
             except Exception as e:
-                logger.error(f"Failed to connect to partition node: {e}")
+                logger.error(f"REAL FAILURE connecting to {node_name}: {e}")
                 partition_success = False
                 partition_conn = None
-                
-                # Log node failure for recovery
-                year = int(delivery_date[:4])
-                if year == 2024:
-                    log_node_failure('node2')
-                elif year == 2025:
-                    log_node_failure('node3')
-        else:
-            logger.warning(f"No partition pool available for date {delivery_date}")
-            partition_success = False
-            partition_conn = None
-            year = int(delivery_date[:4])
-            if year == 2024:
-                log_node_failure('node2')
-            elif year == 2025:
-                log_node_failure('node3')
-        
-        # All locks acquired - perform operations
+                log_node_failure(node_name)
+
         logger.info(f"[2PL] All locks acquired for order {order_id}")
-        
-        # 5. Insert into central node
-        cursor = central_conn.cursor()
+
+        # ---- TIMESTAMP FIX: use explicit UTC timestamp ----
+        utc_now = datetime.now(timezone.utc)
+
+        # Insert SQL (no more NOW()!)
         sql = """
-        INSERT INTO FactOrders (orderID, userID, deliveryDate, riderID, createdAt, updatedAt, productID, quantity)
-        VALUES (%s, 0, %s, 0, NOW(), NOW(), 0, 1)
+        INSERT INTO FactOrders 
+        (orderID, userID, deliveryDate, riderID, createdAt, updatedAt, productID, quantity)
+        VALUES (%s, 0, %s, 0, %s, %s, 0, 1)
         """
-        cursor.execute(sql, (order_id, delivery_date))
+
+        # Insert into central (ALWAYS HAPPENS)
+        cursor = central_conn.cursor()
+        cursor.execute(sql, (order_id, delivery_date, utc_now, utc_now))
         cursor.close()
-        
-        # 6. Insert into partition node
+
+        # Insert into partition (only if node is UP)
         if partition_conn:
             cursor = partition_conn.cursor()
-            cursor.execute(sql, (order_id, delivery_date))
+            cursor.execute(sql, (order_id, delivery_date, utc_now, utc_now))
             cursor.close()
-        
-        # ============ SHRINKING PHASE ============
+
+        # SHRINKING PHASE
         lock_mgr.begin_shrinking_phase()
-        
-        # 7. Commit all transactions
         lock_mgr.commit_all()
-        
-        # 8. Release all locks
         lock_mgr.release_all()
-        
-        year = int(delivery_date[:4])
+
         phantom_warning = check_for_phantom_insert(year, isolation_level)
-        
-        end_time = datetime.now()
+
+        end_time = datetime.now(timezone.utc)
         duration_ms = (end_time - start_time).total_seconds() * 1000
-        
-        response = {
-        "success": True,
-        "message": "Order inserted successfully",
-        "order_id": order_id,
-        "locking_protocol": "2PL (Two-Phase Locking)",
-        "locking_used": use_locking,
-        "replication_status": "success" if partition_success else "partial",  # ADD THIS
-        "lock_summary": lock_mgr.get_lock_summary(),
-        "transaction_time_ms": duration_ms,
-        "concurrency_info": {
-            "isolation_warnings": warnings_info,
-            "phantom_warning": phantom_warning
-        }
-    }
-        
-        return jsonify(response), 201
-        
+
+        return jsonify({
+            "success": True,
+            "message": "Order inserted successfully",
+            "order_id": order_id,
+            "locking_protocol": "2PL (Two-Phase Locking)",
+            "locking_used": use_locking,
+            "replication_status": "success" if partition_success else "partial",
+            "lock_summary": lock_mgr.get_lock_summary(),
+            "transaction_time_ms": duration_ms,
+            "concurrency_info": {
+                "isolation_warnings": warnings_info,
+                "phantom_warning": phantom_warning
+            }
+        }), 201
+
     except Exception as e:
         logger.exception(f"Insert failed: {e}")
         lock_mgr.rollback_all()
         lock_mgr.release_all()
         return jsonify({"error": str(e)}), 500
-    finally:  
+
+    finally:
         lock_mgr.release_all()
 
 @app.route('/api/read', methods=['POST'])
 def read_order():
     """Read an order from all nodes with 2PL"""
-    start_time = datetime.now()
+    start_time = datetime.now(timezone.utc)
     lock_mgr = TwoPhaseLockManager()
     
     try:
@@ -713,7 +732,7 @@ def read_order():
                 "results": results
             }), 404
         
-        end_time = datetime.now()
+        end_time = datetime.now(timezone.utc)
         duration_ms = (end_time - start_time).total_seconds() * 1000
         
         return jsonify({
@@ -739,29 +758,35 @@ def read_order():
 @app.route('/api/update', methods=['POST'])
 def update_order():
     """Update an order with 2PL"""
-    start_time = datetime.now()
+    start_time = datetime.now(timezone.utc)
     lock_mgr = TwoPhaseLockManager()
     
     try:
         data = request.json
         order_id = int(data.get('order_id'))
-        new_delivery_date = data.get('delivery_date')
+        raw_new_delivery_date = data.get('delivery_date')
         isolation_level = data.get('isolation_level', 'READ COMMITTED')
         use_locking = data.get('use_locking', True)
         
-        if not order_id or not new_delivery_date:
+        if not order_id or not raw_new_delivery_date:
             return jsonify({"error": "Missing required fields"}), 400
+
+        # 🔹 Normalize new delivery date (DD/MM/YYYY → YYYY-MM-DD)
+        try:
+            new_delivery_date = normalize_delivery_date(raw_new_delivery_date)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
         
         warnings_info = get_isolation_warnings(isolation_level, "update")
         
         # ============ GROWING PHASE ============
         logger.info(f"[2PL] Starting GROWING phase for UPDATE order {order_id}")
         
-        # 1. First, acquire central connection to check existence
+        # 1. central connection
         central_conn = lock_mgr.acquire_connection(central_pool)
         lock_mgr.set_isolation_level(central_conn, isolation_level)
         
-        # 2. Acquire lock and get current data
+        # 2. lock + check existence
         if use_locking:
             result = lock_mgr.acquire_row_lock(central_conn, order_id, 'FOR UPDATE')
         else:
@@ -773,7 +798,7 @@ def update_order():
         if not result:
             return jsonify({"error": "OrderID does not exist"}), 404
         
-        # Get old delivery date
+        # old delivery date
         cursor = central_conn.cursor()
         cursor.execute("SELECT deliveryDate FROM FactOrders WHERE orderID = %s", (order_id,))
         old_delivery_date = cursor.fetchone()[0]
@@ -782,7 +807,7 @@ def update_order():
         old_year = int(str(old_delivery_date)[:4])
         new_year = int(new_delivery_date[:4])
         
-        # 3. Acquire partition connections
+        # 3. partition connections
         old_partition = determine_partition_node(old_delivery_date)
         new_partition = determine_partition_node(new_delivery_date)
         
@@ -804,20 +829,24 @@ def update_order():
         
         logger.info(f"[2PL] All locks acquired for UPDATE order {order_id}")
         
+        # ---- shared UTC timestamp for this update ----
+        utc_now = datetime.now(timezone.utc)
+        
         # 4. Perform updates with all locks held
         
-        # Handle year change (move between partitions)
+        # Year changed → move between partitions
         if old_year != new_year and old_partition and new_partition:
             logger.info(f"Year changed from {old_year} to {new_year} - moving partitions")
             
             # Insert into new partition
             if 'new' in partition_connections:
                 cursor = partition_connections['new'].cursor()
-                sql = """
-                INSERT INTO FactOrders (orderID, userID, deliveryDate, riderID, createdAt, updatedAt, productID, quantity)
-                VALUES (%s, 0, %s, 0, NOW(), NOW(), 0, 1)
+                insert_sql = """
+                INSERT INTO FactOrders
+                (orderID, userID, deliveryDate, riderID, createdAt, updatedAt, productID, quantity)
+                VALUES (%s, 0, %s, 0, %s, %s, 0, 1)
                 """
-                cursor.execute(sql, (order_id, new_delivery_date))
+                cursor.execute(insert_sql, (order_id, new_delivery_date, utc_now, utc_now))
                 cursor.close()
             
             # Delete from old partition
@@ -826,36 +855,32 @@ def update_order():
                 cursor.execute("DELETE FROM FactOrders WHERE orderID = %s", (order_id,))
                 cursor.close()
         
-        # Update central node
+        # Update central node (always)
         cursor = central_conn.cursor()
-        sql = """
+        update_sql = """
         UPDATE FactOrders
-        SET deliveryDate = %s, updatedAt = NOW()
+        SET deliveryDate = %s, updatedAt = %s
         WHERE orderID = %s
         """
-        cursor.execute(sql, (new_delivery_date, order_id))
+        cursor.execute(update_sql, (new_delivery_date, utc_now, order_id))
         cursor.close()
         
-        # Update partition if same year
+        # Update partition if same year (row stays on same node)
         if old_year == new_year and 'old' in partition_connections:
             cursor = partition_connections['old'].cursor()
-            cursor.execute(sql, (new_delivery_date, order_id))
+            cursor.execute(update_sql, (new_delivery_date, utc_now, order_id))
             cursor.close()
         
         # ============ SHRINKING PHASE ============
         lock_mgr.begin_shrinking_phase()
-        
-        # 5. Commit all
         lock_mgr.commit_all()
-        
-        # 6. Release all locks
         lock_mgr.release_all()
         
         non_repeatable_warning = check_for_non_repeatable_read_update(
             order_id, old_delivery_date, new_delivery_date, isolation_level
         )
         
-        end_time = datetime.now()
+        end_time = datetime.now(timezone.utc)
         duration_ms = (end_time - start_time).total_seconds() * 1000
         
         return jsonify({
@@ -883,7 +908,7 @@ def update_order():
 @app.route('/api/delete', methods=['POST'])
 def delete_order():
     """Delete an order from all nodes with 2PL"""
-    start_time = datetime.now()
+    start_time = datetime.now(timezone.utc)
     lock_mgr = TwoPhaseLockManager()
     
     try:
@@ -949,7 +974,7 @@ def delete_order():
         # 6. Release all locks
         lock_mgr.release_all()
         
-        end_time = datetime.now()
+        end_time = datetime.now(timezone.utc)
         duration_ms = (end_time - start_time).total_seconds() * 1000
         
         return jsonify({
@@ -975,22 +1000,36 @@ def delete_order():
 
 @app.route('/api/recovery/test/case1', methods=['POST'])
 def test_case1():
-    """Case 1: Replication Failure - Node 2 to Central"""
+    """
+    Correct meaning:
+    Node2 failed during insert → Node2 missed data → Recover Node2 from Central
+    """
     try:
-        logger.info("TEST CASE 1: Replication Failure - Node 2 to Central")
-        log_node_failure('node2')
-        start_time = (datetime.now() - timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M:%S')
-        end_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        result = recover_missing_to_central(start_time, end_time)
+        logger.info("TEST CASE 1: Recovering Node2 (missed writes)")
+
+        failure_time = downtime_tracker.get('node2')
+        if not failure_time:
+            return jsonify({
+                "error": "Node2 is not marked as failed. Simulate failure first."
+            }), 400
+
+        start_time = failure_time.strftime('%Y-%m-%d %H:%M:%S')
+        end_time = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+
+        logger.info(f"Starting recovery from {start_time} to {end_time}")
+
+        result = recover_missing_to_partition(start_time, end_time, 2024, node2_pool, 'node2')
+
         return jsonify({
             "success": True,
-            "case": "Case 1: Replication Failure - Node 2 to Central",
-            "result": result,
-            "message": "Recovery completed successfully"
-        }), 200
+            "case": "Node2 Recovery (Central → Node2)",
+            "result": result
+        })
+
     except Exception as e:
-        logger.exception(f"Test Case 1 failed: {e}")
+        logger.exception(e)
         return jsonify({"error": str(e)}), 500
+
 
 @app.route('/api/recovery/test/case2', methods=['POST'])
 def test_case2():
@@ -998,8 +1037,8 @@ def test_case2():
     try:
         logger.info("TEST CASE 2: Central Node Recovery")
         log_node_failure('central')
-        start_time = (datetime.now() - timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M:%S')
-        end_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        start_time = (datetime.now(timezone.utc) - timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M:%S')
+        end_time = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
         result_node2 = recover_missing_to_partition(start_time, end_time, 2024, node2_pool, 'node2')
         result_node3 = recover_missing_to_partition(start_time, end_time, 2025, node3_pool, 'node3')
         downtime_tracker['central'] = None
@@ -1022,8 +1061,8 @@ def test_case3():
     try:
         logger.info("TEST CASE 3: Replication Failure - Central to Node 2")
         log_node_failure('node2')
-        start_time = (datetime.now() - timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M:%S')
-        end_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        start_time = (datetime.now(timezone.utc) - timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M:%S')
+        end_time = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
         result = recover_missing_to_partition(start_time, end_time, 2024, node2_pool, 'node2')
         downtime_tracker['node2'] = None
         return jsonify({
@@ -1042,8 +1081,8 @@ def test_case4():
     try:
         logger.info("TEST CASE 4: Node 2 Recovery")
         log_node_failure('node2')
-        start_time = (datetime.now() - timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M:%S')
-        end_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        start_time = (datetime.now(timezone.utc) - timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M:%S')
+        end_time = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
         result = recover_missing_to_central(start_time, end_time)
         downtime_tracker['node2'] = None
         return jsonify({
@@ -1066,16 +1105,16 @@ def test_all_cases():
         # Case 1
         logger.info("Running Case 1...")
         log_node_failure('node2')
-        start_time = (datetime.now() - timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M:%S')
-        end_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        start_time = (datetime.now(timezone.utc) - timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M:%S')
+        end_time = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
         results['case1'] = recover_missing_to_central(start_time, end_time)
         downtime_tracker['node2'] = None
         
         # Case 2
         logger.info("Running Case 2...")
         log_node_failure('central')
-        start_time = (datetime.now() - timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M:%S')
-        end_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        start_time = (datetime.now(timezone.utc) - timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M:%S')
+        end_time = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
         results['case2_node2'] = recover_missing_to_partition(start_time, end_time, 2024, node2_pool, 'node2')
         results['case2_node3'] = recover_missing_to_partition(start_time, end_time, 2025, node3_pool, 'node3')
         downtime_tracker['central'] = None
@@ -1083,16 +1122,16 @@ def test_all_cases():
         # Case 3
         logger.info("Running Case 3...")
         log_node_failure('node2')
-        start_time = (datetime.now() - timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M:%S')
-        end_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        start_time = (datetime.now(timezone.utc) - timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M:%S')
+        end_time = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
         results['case3'] = recover_missing_to_partition(start_time, end_time, 2024, node2_pool, 'node2')
         downtime_tracker['node2'] = None
         
         # Case 4
         logger.info("Running Case 4...")
         log_node_failure('node2')
-        start_time = (datetime.now() - timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M:%S')
-        end_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        start_time = (datetime.now(timezone.utc) - timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M:%S')
+        end_time = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
         results['case4'] = recover_missing_to_central(start_time, end_time)
         downtime_tracker['node2'] = None
         
@@ -1175,6 +1214,23 @@ def clear_downtime_tracker():
     global downtime_tracker
     downtime_tracker = {'central': None, 'node2': None, 'node3': None}
     return jsonify({"success": True, "message": "Downtime tracker cleared"}), 200
+
+@app.route('/api/recovery/mark/<node_name>', methods=['POST'])
+def mark_node_failure(node_name):
+    """
+    Mark a specific node as DOWN for simulation purposes.
+    Example: POST /api/recovery/mark/node2
+    """
+    valid_nodes = ['central', 'node2', 'node3']
+    if node_name not in valid_nodes:
+        return jsonify({"error": f"Invalid node name '{node_name}'"}), 400
+
+    log_node_failure(node_name)
+
+    return jsonify({
+        "success": True,
+        "message": f"{node_name} marked as FAILED at {downtime_tracker[node_name]}"
+    }), 200
 
 # ========================================================================
 # MAIN
