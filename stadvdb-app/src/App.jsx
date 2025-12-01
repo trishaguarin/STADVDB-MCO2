@@ -71,9 +71,7 @@ const formatResponse = (response, operation) => {
         </span>
       )}
       {response.nodes_locked > 0 && (
-        <span className="locking-status">
-          Nodes Locked: {response.nodes_locked}
-        </span>
+        <span className="locking-status">Nodes Locked: {response.nodes_locked}</span>
       )}
     </div>
   ) : null;
@@ -82,7 +80,7 @@ const formatResponse = (response, operation) => {
     return (
       <div>
         {transactionTimeDisplay}
-        
+
         {response.concurrency_info && (
           <ConcurrencyWarnings concurrencyInfo={response.concurrency_info} />
         )}
@@ -134,15 +132,13 @@ const formatResponse = (response, operation) => {
     return (
       <div>
         {transactionTimeDisplay}
-        
+
         {response.concurrency_info && (
           <ConcurrencyWarnings concurrencyInfo={response.concurrency_info} />
         )}
 
-        <p style={{ color: '#155724', fontWeight: 'bold', marginTop: '12px' }}>
-          {response.message}
-        </p>
-        
+        <p className="success-message">{response.message}</p>
+
         {response.deletion_results && (
           <div className="deletion-results">
             <h4>Deletion Results:</h4>
@@ -210,12 +206,9 @@ const App = () => {
       });
 
       const data = await res.json();
+      if (res.ok) setResponse(data);
+      else setError(data.error || 'Operation failed');
       
-      if (res.ok) {
-        setResponse(data);
-      } else {
-        setError(data.error || 'Operation failed');
-      }
     } catch (err) {
       setError(`Network error: ${err.message}`);
     } finally {
@@ -238,6 +231,7 @@ const App = () => {
   return (
     <div className="app">
       <div className="container">
+        
         {/* Header */}
         <header className="header">
           <div className="header-content">
@@ -259,6 +253,7 @@ const App = () => {
             </div>
             <CheckCircle size={20} className="status-icon" />
           </div>
+
           <div className="node-card">
             <Server size={20} />
             <div>
@@ -267,6 +262,7 @@ const App = () => {
             </div>
             <CheckCircle size={20} className="status-icon" />
           </div>
+
           <div className="node-card">
             <Server size={20} />
             <div>
@@ -283,11 +279,7 @@ const App = () => {
             <h2 className="section-title">Select Isolation Level</h2>
             <div className="isolation-grid">
               {Object.entries(isolationLevels).map(([key, value]) => (
-                <button
-                  key={key}
-                  onClick={() => setIsolationLevel(key)}
-                  className="isolation-button"
-                >
+                <button key={key} onClick={() => setIsolationLevel(key)} className="isolation-button">
                   <div className="isolation-number">{key}</div>
                   <div className="isolation-name">{value}</div>
                 </button>
@@ -300,31 +292,23 @@ const App = () => {
         {isolationLevel && !operation && (
           <div className="section">
             <div className="section-header">
-              <h2 className="section-title">
-                Isolation Level: {isolationLevels[isolationLevel]}
-              </h2>
-              <button onClick={() => setIsolationLevel('')} className="btn-secondary">
-                Change Level
-              </button>
+              <h2 className="section-title">Isolation Level: {isolationLevels[isolationLevel]}</h2>
+              <button onClick={() => setIsolationLevel('')} className="btn-secondary">Change Level</button>
             </div>
-            
+
             <h3 className="operation-title">Select Operation</h3>
             <div className="operation-grid">
               <button onClick={() => handleOperationChange('insert')} className="operation-button">
-                <Plus size={32} />
-                <span>Insert Order</span>
+                <Plus size={32} /><span>Insert Order</span>
               </button>
               <button onClick={() => handleOperationChange('read')} className="operation-button">
-                <Search size={32} />
-                <span>Read Order</span>
+                <Search size={32} /><span>Read Order</span>
               </button>
               <button onClick={() => handleOperationChange('update')} className="operation-button">
-                <Edit size={32} />
-                <span>Update Order</span>
+                <Edit size={32} /><span>Update Order</span>
               </button>
               <button onClick={() => handleOperationChange('delete')} className="operation-button">
-                <Trash2 size={32} />
-                <span>Delete Order</span>
+                <Trash2 size={32} /><span>Delete Order</span>
               </button>
             </div>
           </div>
@@ -333,13 +317,12 @@ const App = () => {
         {/* Operation Form */}
         {isolationLevel && operation && (
           <div className="section">
+
             <div className="section-header">
               <h2 className="section-title">
                 {operation.charAt(0).toUpperCase() + operation.slice(1)} Order
               </h2>
-              <button onClick={() => setOperation('')} className="btn-secondary">
-                Back to Operations
-              </button>
+              <button onClick={() => setOperation('')} className="btn-secondary">Back to Operations</button>
             </div>
 
             {/* Locking Toggle */}
@@ -351,7 +334,7 @@ const App = () => {
                     Locking Strategy: {useLocking ? 'ENABLED' : 'DISABLED'}
                   </h3>
                   <p className="locking-description">
-                    {useLocking 
+                    {useLocking
                       ? 'Distributed locks will be acquired across nodes to prevent conflicts'
                       : 'No explicit locking - relying only on isolation level'
                     }
@@ -388,18 +371,12 @@ const App = () => {
                   onChange={(e) => setDeliveryDate(e.target.value)}
                   className="form-input"
                 />
-                <p className="form-hint">
-                  Year 2024 → Node 2 | Year 2025 → Node 3
-                </p>
+                <p className="form-hint">Year 2024 → Node 2 | Year 2025 → Node 3</p>
               </div>
             )}
 
             <div className="form-actions">
-              <button
-                onClick={handleSubmit}
-                disabled={loading}
-                className="btn-primary"
-              >
+              <button onClick={handleSubmit} disabled={loading} className="btn-primary">
                 {loading ? (
                   <>
                     <Loader className="spinner" size={20} />
@@ -409,12 +386,11 @@ const App = () => {
                   `Execute ${operation.charAt(0).toUpperCase() + operation.slice(1)}`
                 )}
               </button>
-              <button onClick={resetForm} className="btn-secondary">
-                Clear
-              </button>
-            </div>
 
-            {/* Response Display */}
+              <button onClick={resetForm} className="btn-secondary">Clear</button>
+            </div>
+          
+          {/* Response Display */}
             {response && (
               <div className="response response-success">
                 <div className="response-header">
@@ -427,7 +403,7 @@ const App = () => {
               </div>
             )}
 
-            {/* Error Display */}
+           {/* Error Display */}
             {error && (
               <div className="response response-error">
                 <div className="response-header">
