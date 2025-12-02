@@ -818,7 +818,7 @@ def update_order():
         if not order_id or not raw_new_delivery_date:
             return jsonify({"error": "Missing required fields"}), 400
 
-        # 🔹 Normalize new delivery date (DD/MM/YYYY → YYYY-MM-DD)
+        # Normalize new delivery date (DD/MM/YYYY → YYYY-MM-DD)
         try:
             new_delivery_date = normalize_delivery_date(raw_new_delivery_date)
         except ValueError as e:
