@@ -336,6 +336,88 @@
   font-weight: 500;
 }
 
+/* Failure Simulation Section */
+.failure-section {
+  padding: 40px;
+  border-bottom: 1px solid #e5e7eb;
+}
+
+.failure-section .section-title {
+  font-size: 20px;
+  font-weight: 600;
+  margin: 0 0 20px 0;
+  color: #1f2937;
+}
+
+.failure-buttons {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.fail-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 12px 20px;
+  border: 2px solid;
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.3s ease;
+  font-family: inherit;
+  white-space: nowrap;
+}
+
+/* All fail buttons */
+.central-fail,
+.node2-fail,
+.node3-fail {
+  background: #fef2f2;
+  border-color: #ef4444;
+  color: #991b1b;
+}
+
+.central-fail:hover:not(:disabled),
+.node2-fail:hover:not(:disabled),
+.node3-fail:hover:not(:disabled) {
+  background: #fee2e2;
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px rgba(239, 68, 68, 0.3);
+}
+
+.fail-button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* Restore buttons */
+.restore-button {
+  background: #d1fae5;
+  border-color: #10b981;
+  color: #065f46;
+}
+
+.restore-button:hover:not(:disabled) {
+  background: #a7f3d0;
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px rgba(16, 185, 129, 0.3);
+}
+
+@media (max-width: 768px) {
+  .failure-buttons {
+    flex-direction: column;
+    width: 100%;
+  }
+
+  .fail-button {
+    width: 100%;
+  }
+}
+
 /* Results Summary Section */
 .results-summary-section {
   padding: 40px;
