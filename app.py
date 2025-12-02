@@ -24,7 +24,6 @@ def normalize_delivery_date(date_str):
     - '2024-02-14' → '2024-02-14'
     """
 
-    # Already ISO format (YYYY-MM-DD)
     try:
         datetime.strptime(date_str, "%Y-%m-%d")
         return date_str
@@ -544,70 +543,110 @@ def insert_order():
             return jsonify({"error": "Missing required fields"}), 400
         
         warnings_info = get_isolation_warnings(isolation_level, "insert")
-
-        logger.info(f"[2PL] Starting GROWING phase for INSERT order {order_id}")
-
-        # Acquire central connection + lock
-        central_conn = lock_mgr.acquire_connection(central_pool)
-        lock_mgr.set_isolation_level(central_conn, isolation_level)
-
-        if use_locking:
-            result = lock_mgr.acquire_row_lock(central_conn, order_id, 'FOR UPDATE')
-            if result:
-                return jsonify({"error": "OrderID already exists"}), 400
-        else:
-            cursor = central_conn.cursor()
-            cursor.execute("SELECT 1 FROM FactOrders WHERE orderID = %s", (order_id,))
-            if cursor.fetchone():
-                cursor.close()
-                return jsonify({"error": "OrderID already exists"}), 400
-            cursor.close()
-
+        
         # Determine target partition node
         year = int(delivery_date[:4])
         node_name = 'node2' if year == 2024 else 'node3'
-
         partition_pool = determine_partition_node(delivery_date)
+
+        logger.info(f"[2PL] Starting GROWING phase for INSERT order {order_id}")
+
+        # Check node status
+        central_is_down = downtime_tracker.get('central') is not None
+        partition_is_down = downtime_tracker.get(node_name) is not None
+        
+        central_conn = None
         partition_conn = None
+        central_success = True
         partition_success = True
 
-        # Simulated failure check
-        if downtime_tracker.get(node_name):
-            logger.warning(f"[SIMULATED FAILURE] {node_name} is DOWN. Skipping partition insert.")
-            partition_success = False
+        # === CASE 1: Central is DOWN - write to partition only ===
+        if central_is_down:
+            logger.warning(f"[SIMULATED FAILURE] Central is DOWN. Writing to {node_name} only.")
+            
+            if partition_is_down:
+                return jsonify({"error": "Both central and partition are down"}), 503
+            
+            # Write directly to partition
+            partition_conn = lock_mgr.acquire_connection(partition_pool)
+            lock_mgr.set_isolation_level(partition_conn, isolation_level)
+            
+            if use_locking:
+                result = lock_mgr.acquire_row_lock(partition_conn, order_id, 'FOR UPDATE')
+                if result:
+                    return jsonify({"error": "OrderID already exists"}), 400
+            else:
+                cursor = partition_conn.cursor()
+                cursor.execute("SELECT 1 FROM FactOrders WHERE orderID = %s", (order_id,))
+                if cursor.fetchone():
+                    cursor.close()
+                    return jsonify({"error": "OrderID already exists"}), 400
+                cursor.close()
+            
+            central_success = False
+
+        # === CASE 2: Central is UP - try central-primary write ===
         else:
+            # Acquire central connection + lock
             try:
-                if partition_pool:
-                    partition_conn = lock_mgr.acquire_connection(partition_pool)
-                    lock_mgr.set_isolation_level(partition_conn, isolation_level)
+                central_conn = lock_mgr.acquire_connection(central_pool)
+                lock_mgr.set_isolation_level(central_conn, isolation_level)
 
-                    if use_locking:
-                        lock_mgr.acquire_row_lock(partition_conn, order_id, 'FOR UPDATE')
-
+                if use_locking:
+                    result = lock_mgr.acquire_row_lock(central_conn, order_id, 'FOR UPDATE')
+                    if result:
+                        return jsonify({"error": "OrderID already exists"}), 400
+                else:
+                    cursor = central_conn.cursor()
+                    cursor.execute("SELECT 1 FROM FactOrders WHERE orderID = %s", (order_id,))
+                    if cursor.fetchone():
+                        cursor.close()
+                        return jsonify({"error": "OrderID already exists"}), 400
+                    cursor.close()
             except Exception as e:
-                logger.error(f"REAL FAILURE connecting to {node_name}: {e}")
+                logger.error(f"REAL FAILURE connecting to central: {e}")
+                log_node_failure('central')
+                central_success = False
+                central_conn = None
+
+            # Try partition replication
+            if partition_is_down:
+                logger.warning(f"[SIMULATED FAILURE] {node_name} is DOWN. Skipping partition insert.")
                 partition_success = False
-                partition_conn = None
-                log_node_failure(node_name)
+            else:
+                try:
+                    if partition_pool:
+                        partition_conn = lock_mgr.acquire_connection(partition_pool)
+                        lock_mgr.set_isolation_level(partition_conn, isolation_level)
+
+                        if use_locking:
+                            lock_mgr.acquire_row_lock(partition_conn, order_id, 'FOR UPDATE')
+
+                except Exception as e:
+                    logger.error(f"REAL FAILURE connecting to {node_name}: {e}")
+                    partition_success = False
+                    partition_conn = None
+                    log_node_failure(node_name)
 
         logger.info(f"[2PL] All locks acquired for order {order_id}")
 
         # ---- TIMESTAMP FIX: use explicit UTC timestamp ----
         utc_now = datetime.now(timezone.utc)
 
-        # Insert SQL (no more NOW()!)
+        # Insert SQL
         sql = """
         INSERT INTO FactOrders 
         (orderID, userID, deliveryDate, riderID, createdAt, updatedAt, productID, quantity)
         VALUES (%s, 0, %s, 0, %s, %s, 0, 1)
         """
 
-        # Insert into central (ALWAYS HAPPENS)
-        cursor = central_conn.cursor()
-        cursor.execute(sql, (order_id, delivery_date, utc_now, utc_now))
-        cursor.close()
+        # Insert into central (if UP)
+        if central_conn:
+            cursor = central_conn.cursor()
+            cursor.execute(sql, (order_id, delivery_date, utc_now, utc_now))
+            cursor.close()
 
-        # Insert into partition (only if node is UP)
+        # Insert into partition (if UP or primary)
         if partition_conn:
             cursor = partition_conn.cursor()
             cursor.execute(sql, (order_id, delivery_date, utc_now, utc_now))
@@ -623,13 +662,21 @@ def insert_order():
         end_time = datetime.now(timezone.utc)
         duration_ms = (end_time - start_time).total_seconds() * 1000
 
+        replication_status = "success"
+        if not central_success or not partition_success:
+            replication_status = "partial"
+
         return jsonify({
             "success": True,
             "message": "Order inserted successfully",
             "order_id": order_id,
             "locking_protocol": "2PL (Two-Phase Locking)",
             "locking_used": use_locking,
-            "replication_status": "success" if partition_success else "partial",
+            "replication_status": replication_status,
+            "nodes_written": {
+                "central": central_success,
+                "partition": partition_success
+            },
             "lock_summary": lock_mgr.get_lock_summary(),
             "transaction_time_ms": duration_ms,
             "concurrency_info": {
@@ -1231,6 +1278,72 @@ def mark_node_failure(node_name):
         "success": True,
         "message": f"{node_name} marked as FAILED at {downtime_tracker[node_name]}"
     }), 200
+
+@app.route('/api/recovery/restore/<node_name>', methods=['POST'])
+def restore_node(node_name):
+    """
+    Restore a node (bring it back online) and automatically trigger recovery.
+    Recovers data that was missed while the node was down.
+    Example: POST /api/recovery/restore/central
+    """
+    valid_nodes = ['central', 'node2', 'node3']
+    if node_name not in valid_nodes:
+        return jsonify({"error": f"Invalid node name '{node_name}'"}), 400
+    
+    # Check if node was marked as down
+    failure_time = downtime_tracker.get(node_name)
+    if not failure_time:
+        return jsonify({
+            "success": False,
+            "message": f"{node_name} was not marked as down. No recovery needed."
+        }), 400
+    
+    try:
+        logger.info(f"RESTORING {node_name.upper()} - Triggering automatic recovery")
+        
+        start_time = failure_time.strftime('%Y-%m-%d %H:%M:%S')
+        end_time = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+        
+        logger.info(f"Recovery window: {start_time} to {end_time}")
+        
+        result = {}
+        
+        # Determine recovery direction based on which node is being restored
+        if node_name == 'central':
+            # Central was down → Recover FROM partitions TO central
+            logger.info("Central coming back online - recovering from Node 2 and Node 3")
+            result = recover_missing_to_central(start_time, end_time)
+            recovery_direction = "Partitions → Central"
+            
+        elif node_name == 'node2':
+            # Node 2 was down → Recover FROM central TO node2
+            logger.info("Node 2 coming back online - recovering from Central")
+            result = recover_missing_to_partition(start_time, end_time, 2024, node2_pool, 'node2')
+            recovery_direction = "Central → Node 2"
+            
+        elif node_name == 'node3':
+            # Node 3 was down → Recover FROM central TO node3
+            logger.info("Node 3 coming back online - recovering from Central")
+            result = recover_missing_to_partition(start_time, end_time, 2025, node3_pool, 'node3')
+            recovery_direction = "Central → Node 3"
+        
+        # Clear the downtime tracker
+        downtime_tracker[node_name] = None
+        
+        return jsonify({
+            "success": True,
+            "message": f"{node_name} restored successfully",
+            "recovery_direction": recovery_direction,
+            "downtime_period": {
+                "start": start_time,
+                "end": end_time
+            },
+            "result": result
+        }), 200
+        
+    except Exception as e:
+        logger.exception(f"Failed to restore {node_name}: {e}")
+        return jsonify({"error": str(e)}), 500
 
 # ========================================================================
 # MAIN

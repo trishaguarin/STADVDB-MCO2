@@ -167,6 +167,31 @@ const GlobalRecoveryTest = () => {
     }
   };
 
+  const handleRestoreNode = async (node) => {
+    setLoading(true);
+    setError('');
+    setResponse(null);
+    setSelectedCase(`restore-${node}`);
+
+    try {
+      const res = await fetch(`${API_BASE_URL}/recovery/restore/${node}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      });
+
+      const data = await res.json();
+      if (res.ok) {
+        setResponse(data);
+      } else {
+        setError(data.error || 'Failed to restore node');
+      }
+    } catch (err) {
+      setError(`Network error: ${err.message}`);
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const formatRecoveryResult = (result) => {
     if (!result) return null;
 
@@ -248,6 +273,39 @@ const GlobalRecoveryTest = () => {
               className="fail-button node3-fail"
             >
               Fail Node 3
+            </button>
+          </div>
+        </div>
+
+        {/* Restore Node Section */}
+        <div className="failure-section">
+          <h2 className="section-title">Restore Node (Auto-Recovery)</h2>
+          <div className="failure-buttons">
+            <button
+              onClick={() => handleRestoreNode("central")}
+              disabled={loading}
+              className="fail-button central-fail"
+              style={{backgroundColor: '#10b981'}}
+            >
+              <RefreshCw size={18} /> Restore Central
+            </button>
+
+            <button
+              onClick={() => handleRestoreNode("node2")}
+              disabled={loading}
+              className="fail-button node2-fail"
+              style={{backgroundColor: '#10b981'}}
+            >
+              <RefreshCw size={18} /> Restore Node 2
+            </button>
+
+            <button
+              onClick={() => handleRestoreNode("node3")}
+              disabled={loading}
+              className="fail-button node3-fail"
+              style={{backgroundColor: '#10b981'}}
+            >
+              <RefreshCw size={18} /> Restore Node 3
             </button>
           </div>
         </div>
